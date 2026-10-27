@@ -5,7 +5,7 @@ verified findings, fixed PDF report with PoC + code-fix examples,
 enriched popup data (path, command, remediation).
 """
 
-import os, re, uuid, json, time, queue, threading, subprocess, shutil, html, socket, signal, ipaddress, select, urllib.request, urllib.parse, math as _math, inspect
+import os, re, uuid, json, time, queue, threading, subprocess, shutil, html, socket, signal, ipaddress, select, urllib.request, urllib.parse, math as _math, inspect, shlex
 from datetime import datetime
 from flask import Flask, request, Response, jsonify, send_file
 from reportlab.lib.pagesizes import A4
@@ -32,6 +32,37 @@ except (TypeError, ValueError):
 if PWM_CMD_TIMEOUT < 0:
     PWM_CMD_TIMEOUT = 0.0
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _nuclei_templates_dir():
+    """Resolve the installed nuclei template directory at import time instead
+    of hardcoding one user's home path (the old value only worked on the
+    original author's machine)."""
+    candidates = [
+        os.environ.get('NUCLEI_TEMPLATES_DIR', ''),
+        os.path.expanduser('~/.local/nuclei-templates'),
+        os.path.expanduser('~/nuclei-templates'),
+        '/usr/share/nuclei-templates',
+        os.path.expanduser('~/.config/nuclei-templates'),
+    ]
+    for cand in candidates:
+        if cand and os.path.isdir(os.path.join(cand, 'http')):
+            return cand
+    # Last resort: whatever path nuclei itself reports as its config/template
+    # home — never an invented path.
+    try:
+        proc = subprocess.run(['nuclei', '-version'], capture_output=True,
+                              text=True, timeout=5)
+        out = (proc.stdout or '') + '\n' + (proc.stderr or '')
+        m = re.search(r'(?:Nuclei\s+)?[Tt]emplate[s]?\s+[Dd]irector(?:y|ies)\s*:\s*(\S+)', out)
+        if m and os.path.isdir(m.group(1)):
+            return m.group(1).rstrip('/')
+    except Exception:
+        pass
+    return os.path.expanduser('~/.local/nuclei-templates')
+
+
+NUCLEI_TPL = _nuclei_templates_dir()
 
 @app.before_request
 def _api_token_gate():
@@ -100,11 +131,18 @@ CHAIN = [
                 "parse": "waf",
             },
             {
-                "id": "recon_subdomains", "label": "Subdomain Enumeration", "tool": "dnsrecon / crt.sh / dig",
-                "description": "Passive subdomain gathering (ct logs, search engines) plus a brute-force pass, then validating which candidates actually resolve to A records. The parser only reports subdomains that resolved.",
-                "cmd_template": "echo '=CRT.SH='; case {target} in *[a-zA-Z]*) curl -s --max-time 12 'https://crt.sh/?q=%25.{target}&output=json' 2>/dev/null | python3 -c \"import json,sys\ntry:\n d=json.load(sys.stdin)[:80]\nexcept Exception:\n d=[]\nfor x in d:\n print(x.get('name_value',''))\" 2>/dev/null || echo '[crt.sh unavailable]';; *) echo '[crt.sh skipped — IP target]';; esac; echo '=DNSRECON='; if command -v dnsrecon >/dev/null 2>&1; then timeout -k 5 90 dnsrecon -d {target} -t std,brt -D /usr/share/wordlists/dnsrecon/top-level-names.txt 2>&1 | grep -iE 'A |CNAME|NS |SOA ' | head -50; else echo '[dnsrecon not installed]'; fi; echo '=RESOLVED SUBS='; for s in www api dev admin mail vpn portal staging app test beta m login dashboard; do ip=$(dig +short $s.{target} A 2>/dev/null | head -1); if [ -n \"$ip\" ]; then echo \"$s.{target} -> $ip\"; fi; done",
+                "id": "recon_subdomains", "label": "Subdomain Discovery", "tool": "crt.sh / dnsrecon / amass / dig",
+                "description": "Multi-source subdomain discovery: certificate-transparency logs (crt.sh) and amass passive enumeration, a dnsrecon standard + brute-force pass, and a resolver sweep over common names. Every candidate is DNS-validated — the parser only reports subdomains that actually resolved to an address; unresolved names are never reported.",
+                "cmd_template": "echo '=CRT.SH RESOLVED='; if echo '{target}' | grep -q '[a-zA-Z]'; then curl -s --max-time 15 'https://crt.sh/?q=%25.{target}&output=json' 2>/dev/null | python3 -c \"import json,sys\ntry:\n d=json.load(sys.stdin)\nexcept Exception:\n d=[]\ns=set()\nfor x in d:\n for n in (x.get('name_value') or '').split(chr(10)):\n  n=n.strip().lstrip('*.').lower()\n  if n.endswith('.{target}') or n==('{target}'):\n   s.add(n)\nfor n in sorted(s)[:80]:\n print(n)\" 2>/dev/null | while read h; do ip=$(dig +short \"$h\" A 2>/dev/null | head -1); [ -n \"$ip\" ] && echo \"$h -> $ip\"; done; else echo '[crt.sh skipped — IP target]'; fi; echo '=DNSRECON='; if command -v dnsrecon >/dev/null 2>&1; then timeout -k 5 90 dnsrecon -d {target} -t std,brt -D /usr/share/wordlists/dnsrecon/top-level-names.txt 2>&1 | grep -iE '\\[+\\] (A|CNAME)' | head -60; else echo '[dnsrecon not installed]'; fi; echo '=AMASS PASSIVE='; if command -v amass >/dev/null 2>&1; then timeout -k 5 120 amass enum -passive -d {target} 2>&1 | grep -iE '^[a-z0-9_.-]+\\.{target}$' | sort -u | head -60; else echo '[amass not installed]'; fi; echo '=RESOLVED SUBS='; for s in www api dev admin mail vpn portal staging stage app test beta m mobile login dashboard auth sso oauth gateway proxy cdn static assets img media files docs support intranet internal hr crm jenkins git gitlab ci registry db mysql postgres redis cache queue analytics monitor status; do ip=$(dig +short $s.{target} A 2>/dev/null | head -1); if [ -n \"$ip\" ]; then echo \"$s.{target} -> $ip\"; fi; done",
                 "fallback_cmd": "echo '=RESOLVED SUBS='; for s in www api dev admin mail; do ip=$(dig +short $s.{target} A 2>/dev/null | head -1); [ -n \"$ip\" ] && echo \"$s.{target} -> $ip\"; done",
                 "parse": "subdomains",
+            },
+            {
+                "id": "recon_urls", "label": "URL & Endpoint Discovery", "tool": "katana / curl",
+                "description": "Enumerates every URL the application exposes: robots.txt and sitemap.xml entries plus a katana crawl (link following, JavaScript endpoint parsing, known-file discovery). Informational only — each reported URL was actually reached or declared by the site; nothing is guessed.",
+                "cmd_template": "echo '=ROBOTS='; curl -sk --max-time 8 {base_url}/robots.txt 2>&1 | head -60; echo '=SITEMAP='; curl -sk --max-time 8 {base_url}/sitemap.xml 2>&1 | grep -oiE '<loc>[^<]+' | sed 's/<loc>//I' | head -60; echo '=KATANA='; if command -v katana >/dev/null 2>&1; then timeout -k 5 180 katana -u {base_url} -silent -d 3 -jc -kf all 2>/dev/null | sort -u | head -200; else echo '[katana not installed]'; fi",
+                "fallback_cmd": "echo '=ROBOTS='; curl -sk --max-time 8 {base_url}/robots.txt 2>&1 | head -40; echo '=SITEMAP='; curl -sk --max-time 8 {base_url}/sitemap.xml 2>&1 | grep -oE 'https?://[^ ]+' | head -40",
+                "parse": "urls",
             },
             {
                 "id": "recon_osint_passive", "label": "Passive OSINT", "tool": "whois / RIPE / geoip",
@@ -116,7 +154,7 @@ CHAIN = [
             {
                 "id": "recon_breach_osint", "label": "Employee / Email Breach OSINT", "tool": "theHarvester / HIBP",
                 "description": "Harvests employee emails via theHarvester (written to {outdir}/theharvester_emails.txt). If PWM_HIBP_KEY is set, each unique address is checked against Have I Been Pwned; a COMPROMISED finding is only emitted for a real 200 breach response.",
-                "cmd_template": "mkdir -p {outdir}/osint; if command -v theHarvester >/dev/null 2>&1; then timeout -k 5 120 theHarvester -d {target} -b baidu,bing,dnsdumpster,crtsh,hackertarget -l 300 2>&1 | tee {outdir}/theharvester_emails.txt | sed -n '/Emails found/,$p' | grep -oiE '[a-z0-9._%+-]+@[a-z0-9.-]+' | sort -u | head -40; else echo '[theHarvester not installed]'; fi; echo '=HIBP CHECK='; if [ -n \"$PWM_HIBP_KEY\" ]; then python3 -c \"import os,re,urllib.request,urllib.error,json\nkey=os.environ.get('PWM_HIBP_KEY'); em=[]\ntry:\n for line in open('{outdir}/theharvester_emails.txt',errors='ignore'):\n  em += re.findall(r'[a-z0-9._%+-]+@[a-z0-9.-]+',line)\nexcept Exception:\n pass\nfor e in list(dict.fromkeys(em))[:15]:\n try:\n  req=urllib.request.Request('https://haveibeenpwned.com/api/v3/breachedaccount/'+e,headers={'hibp-api-key':key,'user-agent':'pwm-osint'})\n  r=urllib.request.urlopen(req,timeout=10)\n  d=json.load(r)\n  if isinstance(d,list) and d: print('COMPROMISED:'+e+'|'+','.join((x.get('Name') or '') for x in d[:5]))\n  else: print('NO_BREACH:'+e)\n except urllib.error.HTTPError as he:\n  if he.code==404: print('NO_BREACH:'+e)\n  else: print('HIBP_ERROR:'+e+'|http_'+str(he.code))\n except Exception as ex:\n  print('HIBP_ERROR:'+e+'|'+str(ex)[:60])\n\"; else echo '[PWM_HIBP_KEY not set — breach lookup skipped; discovery only]'; fi",
+                "cmd_template": "mkdir -p {outdir}/osint; if command -v theHarvester >/dev/null 2>&1; then timeout -k 5 120 theHarvester -d {target} -b baidu,yahoo,dnsdumpster,certspotter,crtsh,hackertarget,rapiddns -l 300 2>&1 | tee {outdir}/theharvester_emails.txt | sed -n '/Emails found/,$p' | grep -oiE '[a-z0-9._%+-]+@[a-z0-9.-]+' | sort -u | head -40; else echo '[theHarvester not installed]'; fi; echo '=HIBP CHECK='; if [ -n \"$PWM_HIBP_KEY\" ]; then python3 -c \"import os,re,urllib.request,urllib.error,json\nkey=os.environ.get('PWM_HIBP_KEY'); em=[]\ntry:\n for line in open('{outdir}/theharvester_emails.txt',errors='ignore'):\n  em += re.findall(r'[a-z0-9._%+-]+@[a-z0-9.-]+',line)\nexcept Exception:\n pass\nfor e in list(dict.fromkeys(em))[:15]:\n try:\n  req=urllib.request.Request('https://haveibeenpwned.com/api/v3/breachedaccount/'+e,headers={'hibp-api-key':key,'user-agent':'pwm-osint'})\n  r=urllib.request.urlopen(req,timeout=10)\n  d=json.load(r)\n  if isinstance(d,list) and d: print('COMPROMISED:'+e+'|'+','.join((x.get('Name') or '') for x in d[:5]))\n  else: print('NO_BREACH:'+e)\n except urllib.error.HTTPError as he:\n  if he.code==404: print('NO_BREACH:'+e)\n  else: print('HIBP_ERROR:'+e+'|http_'+str(he.code))\n except Exception as ex:\n  print('HIBP_ERROR:'+e+'|'+str(ex)[:60])\n\"; else echo '[PWM_HIBP_KEY not set — breach lookup skipped; discovery only]'; fi",
                 "fallback_cmd": "echo '[theHarvester not available — no email OSINT run]'",
                 "parse": "breach_osint",
             },
@@ -137,14 +175,14 @@ CHAIN = [
             {
                 "id": "recon_tech", "label": "Web Stack / Technology Fingerprint", "tool": "whatweb / nuclei",
                 "description": "Fingerprint the web stack — server, CMS, framework, libraries — via whatweb level-3 and the nuclei technologies template set. Emits informational technology findings only.",
-                "cmd_template": "echo '=WHATWEB='; if command -v whatweb >/dev/null 2>&1; then timeout -k 5 60 whatweb -a 3 http://{target} 2>&1 | head -30; else echo '[whatweb not installed]'; fi; echo '=NUCLEI TECHNOLOGIES='; if command -v nuclei >/dev/null 2>&1; then timeout -k 5 120 nuclei -u http://{target} -t /home/spidersecops/.local/nuclei-templates/http/technologies -silent 2>&1 | head -60; else echo '[nuclei not installed]'; fi",
+                "cmd_template": "echo '=WHATWEB='; if command -v whatweb >/dev/null 2>&1; then timeout -k 5 60 whatweb -a 3 http://{target} 2>&1 | head -30; else echo '[whatweb not installed]'; fi; echo '=NUCLEI TECHNOLOGIES='; if command -v nuclei >/dev/null 2>&1 && [ -d {nuclei_dir}/http/technologies ]; then timeout -k 5 120 nuclei -u http://{target} -t {nuclei_dir}/http/technologies -silent -duc 2>&1 | head -60; else echo '[nuclei or templates not installed]'; fi",
                 "fallback_cmd": "curl -skIL --max-time 8 http://{target} 2>&1 | head -30",
                 "parse": "tech",
             },
             {
                 "id": "recon_nuclei", "label": "Nuclei Exposure & Misconfig Recon", "tool": "nuclei",
                 "description": "Scan against exposures, misconfiguration, exposed-panels and token-spray templates only — recon-grade detection feeding later verification.",
-                "cmd_template": "if command -v nuclei >/dev/null 2>&1; then timeout -k 5 180 nuclei -u http://{target} -t /home/spidersecops/.local/nuclei-templates/http/exposures -t /home/spidersecops/.local/nuclei-templates/http/misconfiguration -t /home/spidersecops/.local/nuclei-templates/http/exposed-panels -t /home/spidersecops/.local/nuclei-templates/http/token-spray -severity critical,high,medium -silent -o {outdir}/nuclei_recon.txt 2>&1 | head -80; else echo '[nuclei not installed]'; fi",
+                "cmd_template": "if command -v nuclei >/dev/null 2>&1 && [ -d {nuclei_dir}/http ]; then timeout -k 5 180 nuclei -u http://{target} -t {nuclei_dir}/http/exposures -t {nuclei_dir}/http/misconfiguration -t {nuclei_dir}/http/exposed-panels -t {nuclei_dir}/http/token-spray -severity critical,high,medium -silent -duc -o {outdir}/nuclei_recon.txt 2>&1 | head -80; else echo '[nuclei or templates not installed]'; fi",
                 "fallback_cmd": "echo '[nuclei not installed]'",
                 "parse": "nuclei",
             },
@@ -185,14 +223,14 @@ CHAIN = [
             {
                 "id": "vuln_nuclei", "label": "Nuclei Template Scan", "tool": "nuclei",
                 "description": "Fast template-based vulnerability scanner covering CVEs, misconfigs, exposures, default-logins and takeovers.",
-                "cmd_template": "nuclei -u http://{target} -severity critical,high,medium -t cves/ -t vulnerabilities/ -t misconfiguration/ -t exposures/ -t default-logins/ -t takeovers/ -o {outdir}/nuclei.txt -rate-limit 50 2>&1 | head -80",
+                "cmd_template": "nuclei -u http://{target} -severity critical,high,medium -t {nuclei_dir}/http/cves -t {nuclei_dir}/http/vulnerabilities -t {nuclei_dir}/http/misconfiguration -t {nuclei_dir}/http/exposures -t {nuclei_dir}/http/default-logins -t {nuclei_dir}/http/takeovers -o {outdir}/nuclei.txt -rate-limit 50 -duc 2>&1 | head -80",
                 "fallback_cmd": "echo '[nuclei not installed] Install: go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest'",
                 "parse": "nuclei",
             },
             {
                 "id": "vuln_searchsploit", "label": "ExploitDB Lookup", "tool": "searchsploit",
                 "description": "Search offline ExploitDB for each discovered service banner.",
-                "cmd_template": "searchsploit --colour {banner_search} 2>&1 | head -60",
+                "cmd_template": "searchsploit {banner_search} 2>&1 | head -60",
                 "parse": "searchsploit",
             },
             {
@@ -402,8 +440,148 @@ CHAIN = [
         ],
     },
     {
-        "id": "exploit_prep", "label": "Stage 6 — Exploitation Prep",
-        "color": "coral", "icon": "06", "parallel": False,
+        "id": "reg_scan", "label": "Stage 6 — Registration & Account Provisioning",
+        "color": "teal", "icon": "06", "parallel": False,
+        "substages": [
+            {
+                "id": "reg_discovery", "label": "Signup Endpoint Discovery", "tool": "in-process HTTP",
+                "description": "Probes common registration paths for a real signup form (password field / register markers), extracts form fields and action, and records whether a CAPTCHA is present. Discovery only — emits informational path findings.",
+                "parse": "inprocess",
+            },
+            {
+                "id": "reg_captcha", "label": "Signup CAPTCHA / Anti-Automation", "tool": "in-process HTTP",
+                "description": "Reports whether the discovered registration form challenges automated abuse with a CAPTCHA. Emits a low finding only when a real signup form was found and no challenge marker is present.",
+                "parse": "inprocess",
+            },
+            {
+                "id": "reg_enum", "label": "Account Enumeration at Signup", "tool": "in-process HTTP",
+                "description": "Submits one new and one duplicate registration probe and compares the responses. Emits a finding only when the duplicate is distinguishable and the response explicitly indicates the account already exists.",
+                "parse": "inprocess",
+            },
+            {
+                "id": "reg_password_policy", "label": "Password Policy at Signup", "tool": "in-process HTTP",
+                "description": "Submits a single weak-password registration probe. Emits a finding only when the registration is accepted and no policy-rejection language is returned.",
+                "parse": "inprocess",
+            },
+            {
+                "id": "reg_verification_bypass", "label": "Email-Verification Bypass", "tool": "in-process HTTP",
+                "description": "Uses the account created during enumeration to test whether an authenticated session is issued while the response simultaneously demands email verification. Never claims bypass without both conditions.",
+                "parse": "inprocess",
+            },
+            {
+                "id": "reg_mass_assign", "label": "Signup Mass-Assignment (Overposting)", "tool": "in-process HTTP",
+                "description": "Submits a registration probe carrying role/isAdmin/admin attributes and emits a finding only when the response reflects the injected privileged value.",
+                "parse": "inprocess",
+            },
+            {
+                "id": "reg_rate_limit", "label": "Registration Rate Limiting", "tool": "in-process HTTP",
+                "description": "Sends a bounded burst (6) of registration attempts reusing one identity (no extra accounts created). Emits a finding only when the endpoint responded and no throttling/block occurred.",
+                "parse": "inprocess",
+            },
+        ],
+    },
+    {
+        "id": "auth_scan", "label": "Stage 7 — Authentication & Login",
+        "color": "purple", "icon": "07", "parallel": False,
+        "substages": [
+            {
+                "id": "auth_discovery", "label": "Login Endpoint Discovery", "tool": "in-process HTTP",
+                "description": "Probes common login paths for a real authentication form, extracts its field names and action, and records whether MFA is present. Discovery only — informational path findings.",
+                "parse": "inprocess",
+            },
+            {
+                "id": "auth_enum", "label": "Username Enumeration at Login", "tool": "in-process HTTP",
+                "description": "Compares the login response for a known identity with a wrong password against an unknown identity. Emits a finding only when responses are distinguishable AND the unknown response explicitly says the user is absent while the known response says the password is wrong.",
+                "parse": "inprocess",
+            },
+            {
+                "id": "auth_lockout", "label": "Login Lockout / Throttling", "tool": "in-process HTTP",
+                "description": "Sends a bounded burst (6) of wrong-password attempts for one existing identity. Emits a finding only when the endpoint kept responding and never throttled or locked (CWE-307). Never performs credential stuffing.",
+                "parse": "inprocess",
+            },
+            {
+                "id": "auth_password_reset", "label": "Password-Reset Flow", "tool": "in-process HTTP",
+                "description": "Discovers a password-reset endpoint and triggers one reset for a known identity. Emits a finding only when the response discloses the reset token/link in the HTTP body (CWE-640).",
+                "parse": "inprocess",
+            },
+            {
+                "id": "auth_oauth", "label": "OAuth / SSO redirect_uri", "tool": "in-process HTTP",
+                "description": "Probes OAuth authorize endpoints with an attacker redirect_uri. Emits a finding only when the Location reflects the attacker host without validation (CWE-346).",
+                "parse": "inprocess",
+            },
+            {
+                "id": "auth_logout", "label": "Session Invalidation on Logout", "tool": "in-process HTTP", "requires_creds": True,
+                "description": "Logs in with an operator account, calls logout, then reuses the old cookie against protected paths. Emits a finding only when the stale cookie still returns protected content (CWE-613).",
+                "parse": "inprocess",
+            },
+        ],
+    },
+    {
+        "id": "session_scan", "label": "Stage 8 — Session Management",
+        "color": "indigo", "icon": "08", "parallel": False,
+        "substages": [
+            {
+                "id": "session_cookie_flags", "label": "Session Cookie Flags", "tool": "in-process HTTP", "requires_creds": True,
+                "description": "Logs in with an operator account and inspects the Set-Cookie attributes. Emits a finding only for missing HttpOnly/Secure/SameSite flags on the actual session cookie.",
+                "parse": "inprocess",
+            },
+            {
+                "id": "session_entropy", "label": "Session Identifier Entropy", "tool": "in-process HTTP", "requires_creds": True,
+                "description": "Collects a few session cookies via repeated logins and flags low entropy only when the identifier is short (<12) or uses a tiny character set (<8) (CWE-330).",
+                "parse": "inprocess",
+            },
+            {
+                "id": "session_fixation", "label": "Session Fixation on Login", "tool": "in-process HTTP", "requires_creds": True,
+                "description": "Compares the pre-authentication cookie with the post-authentication cookie. Emits a finding only when the identifier is not rotated on authentication (CWE-384).",
+                "parse": "inprocess",
+            },
+            {
+                "id": "session_jwt", "label": "JWT Session Token", "tool": "in-process HTTP", "requires_creds": True,
+                "description": "Decodes the session token if it is a JWT. Emits a finding only when the header declares alg 'none'/empty (unsigned); otherwise records an informational observation.",
+                "parse": "inprocess",
+            },
+        ],
+    },
+    {
+        "id": "authz_scan", "label": "Stage 9 — Authorization & Access Control",
+        "color": "rose", "icon": "09", "parallel": False,
+        "substages": [
+            {
+                "id": "authz_forced_browsing", "label": "Unauthenticated Privileged Access", "tool": "in-process HTTP",
+                "description": "Requests common administrative/privileged paths without authentication. Emits a finding only when such a path returns HTTP 200 with administrative content and no login form.",
+                "parse": "inprocess",
+            },
+            {
+                "id": "authz_vertical", "label": "Vertical Privilege Escalation", "tool": "in-process HTTP", "requires_creds": True,
+                "description": "Compares unauthenticated vs non-admin-authenticated access to admin functions. Emits a finding only when a path that rejects anonymous users returns admin content to a non-admin session.",
+                "parse": "inprocess",
+            },
+            {
+                "id": "authz_idor", "label": "Object-Level Authorization (BOLA/IDOR)", "tool": "in-process HTTP", "requires_creds": True,
+                "description": "With an operator account, requests another identity's object on discovered object endpoints. Emits a finding only when the endpoint is auth-protected yet returns the other identity's distinct data.",
+                "parse": "inprocess",
+            },
+        ],
+    },
+    {
+        "id": "bizlogic_scan", "label": "Stage 10 — Business Logic",
+        "color": "amber", "icon": "10", "parallel": False,
+        "substages": [
+            {
+                "id": "bizlogic_csrf", "label": "CSRF Protection on State-Changing Forms", "tool": "in-process HTTP",
+                "description": "Inspects discovered state-changing forms for an anti-CSRF token. Emits a finding only when a cookie-based session is in use, the form has no token field, and the session cookie has no SameSite attribute.",
+                "parse": "inprocess",
+            },
+            {
+                "id": "bizlogic_workflow", "label": "Business-Logic Coverage", "tool": "in-process HTTP",
+                "description": "Records an honest informational coverage note: application-specific workflow/price/quantity logic cannot be verified generically and is not tested (never emitted as a vulnerability).",
+                "parse": "inprocess",
+            },
+        ],
+    },
+    {
+        "id": "exploit_prep", "label": "Stage 11 — Exploitation Prep",
+        "color": "coral", "icon": "11", "parallel": False,
         "substages": [
             {
                 "id": "ep_hydra", "label": "Default Credential Test", "tool": "hydra",
@@ -429,7 +607,7 @@ CHAIN = [
             {
                 "id": "ep_vuln_verify", "label": "CVE / Exploit Verification", "tool": "searchsploit",
                 "description": "Cross-reference all discovered service versions against ExploitDB. List applicable modules.",
-                "cmd_template": "searchsploit --colour {banner_search} 2>&1 | head -40",
+                "cmd_template": "searchsploit {banner_search} 2>&1 | head -40",
                 "parse": "searchsploit",
             },
             {
@@ -441,8 +619,8 @@ CHAIN = [
         ],
     },
     {
-        "id": "postex", "label": "Stage 7 — Post-Exploitation Review",
-        "color": "purple", "icon": "07", "parallel": True,
+        "id": "postex", "label": "Stage 12 — Post-Exploitation Review",
+        "color": "purple", "icon": "12", "parallel": True,
         "substages": [
             {
                 "id": "pe_network_map", "label": "Network Segment Discovery", "tool": "nmap / arp-scan",
@@ -542,8 +720,8 @@ REDIRECT_CODES = frozenset({'300', '301', '302', '303', '304', '305', '307', '30
 # VULNERABLE", "isn't vulnerable", "does not appear to be vulnerable",
 # "non-vulnerable", "is not exploitable", …) must never become a finding.
 _NEGATED_RESULT = re.compile(
-    r"\bnot\b[^.!?\n;]{0,40}\b(?:vulnerable|exploitable)\b"
-    r"|\b(?:isn't|aren't|wasn't|don't|doesn't|didn't|can't)\b[^.!?\n;]{0,40}\bvulnerable\b"
+    r"\bnot\b[^.!?\n;]{0,40}\b(?:vulnerable|exploitable|injectable)\b"
+    r"|\b(?:isn't|aren't|wasn't|don't|doesn't|didn't|can't)\b[^.!?\n;]{0,40}\b(?:vulnerable|injectable)\b"
     r"|\bnon[-\s]?vulnerable\b"
     r"|\bnever\s+vulnerable\b",
     re.I)
@@ -689,8 +867,23 @@ def score_finding(f):
     The vector is either the curated profile for the finding class or the
     severity-fallback vector; both are explicit, reviewable strings. If the
     computed severity band disagrees with the finding's own label, that
-    disagreement is recorded (`band_mismatch`) rather than hidden."""
+    disagreement is recorded (`band_mismatch`) rather than hidden.
+
+    A finding that already carries a parser-supplied vector (e.g. NVD
+    CPE-verified CVEs) keeps it — the parser's real vector is never replaced
+    by a curated profile; only the band/mismatch fields are (re)derived."""
     sev = f.get('severity', 'info')
+    existing = f.get('cvss')
+    if isinstance(existing, dict) and existing.get('vector'):
+        cv = dict(existing)
+        if cv.get('base_score') is None:
+            cv['base_score'] = cvss31_base_score(cv['vector'])
+        band = cv.get('severity_band') or cvss31_band(cv.get('base_score'))
+        cv['severity_band'] = band
+        cv['band_mismatch'] = bool(band and sev in
+                                   ('critical', 'high', 'medium', 'low') and band != sev)
+        f['cvss'] = cv
+        return f
     if sev not in ('critical', 'high', 'medium', 'low'):
         f['cvss'] = {"vector": None, "base_score": 0.0, "severity_band": None, "note": "informational — not scored"}
         return f
@@ -887,10 +1080,13 @@ def _capture_evidence(f, sess):
         return rec
 
     # Screenshot via headless chrome.
+    shot = None
+    chrome_found = False
     for binname in _CHROME_BINS:
         path = shutil.which(binname)
         if not path:
             continue
+        chrome_found = True
         shot = os.path.join(evdir, f"{idx:02d}_{stamp}_{f.get('type','x')}.png")
         ok = True
         try:
@@ -913,7 +1109,9 @@ def _capture_evidence(f, sess):
             break
         if not ok:
             rec["errors"].append(f"{binname} screenshot produced no valid PNG")
-    if not rec["screenshots"] and os.path.exists(shot):
+    if not chrome_found:
+        rec["errors"].append("no headless chrome binary found — screenshot skipped")
+    if shot and os.path.exists(shot):
         try: os.remove(shot)
         except OSError: pass
 
@@ -981,6 +1179,14 @@ def clean_target(raw):
         return host
     return t.split('/')[0]
 
+def _origin_from_raw(raw):
+    """Preserve an operator-supplied scheme://host:port for the auth-tier
+    in-process probes (the host-based shell templates intentionally use the
+    port-less {target})."""
+    m = re.match(r'^(https?)://([^/\s]+)', (raw or '').strip(), re.I)
+    return f"{m.group(1).lower()}://{m.group(2)}" if m else None
+
+
 def is_valid_target(t):
     """Allow only hostnames, IPv4 (optionally with CIDR) and IPv6 literals.
     Rejects anything containing shell metacharacters (command injection guard)."""
@@ -1006,12 +1212,18 @@ def infer_network(target):
 
 def make_cmd(template, sess):
     ports = sess.get('ports_found') or '21,22,23,25,53,80,110,443,445,3306,3389,8080'
+    # Every substituted value is shell-quoted: {banner_search} carries raw
+    # target-controlled banner text and would otherwise be parsed as shell
+    # syntax (command injection). For validated hostnames/IPs/ports/outdirs
+    # shlex.quote() is a no-op — the command string is unchanged.
     vals = {
-        'target': sess['target'],
-        'outdir': sess['outdir'],
-        'ports': ports,
-        'banner_search': sess.get('banner_search', sess['target']),
-        'network': sess.get('network', infer_network(sess['target'])),
+        'target': shlex.quote(sess['target']),
+        'outdir': shlex.quote(sess['outdir']),
+        'base_url': shlex.quote(_base_url(sess)),
+        'ports': shlex.quote(ports),
+        'banner_search': shlex.quote(sess.get('banner_search', sess['target'])),
+        'network': shlex.quote(sess.get('network', infer_network(sess['target']))),
+        'nuclei_dir': shlex.quote(NUCLEI_TPL),
     }
     def repl(m):
         if m.group(0) == '{{':
@@ -1209,15 +1421,28 @@ def parse_vulners(output):
     return findings
 
 def parse_searchsploit(output):
+    """searchsploit result rows: '<Title> | <edb/path>'. Usage/help/error text
+    (which contains '|' characters) must never become findings — that was
+    fabricating 'exploit_available' highs from the tool's own usage banner.
+    The path column must look like a real EDB path (dir/dir/id.ext)."""
+    if 'Usage: searchsploit' in output or 'illegal option' in output \
+            or 'invalid option' in output:
+        return []
+    output = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', output)   # strip colour codes
     findings = []
     for line in output.splitlines():
-        if '|' in line and 'Exploit Title' not in line and '---' not in line and len(line.strip())>5:
-            parts = [p.strip() for p in line.split('|')]
-            if len(parts) >= 2 and parts[0]:
-                findings.append({"type":"exploit_available","title":parts[0],
-                                  "path":"searchsploit match","severity":"high",
-                                  "detail":parts[0],
-                                  "command":f"searchsploit -m {parts[-1].strip()}"})
+        if '|' not in line or 'Exploit Title' in line or '---' in line or len(line.strip()) <= 5:
+            continue
+        parts = [p.strip() for p in line.split('|')]
+        if len(parts) < 2 or not parts[0]:
+            continue
+        path = parts[-1]
+        if '/' not in path or not re.match(r'^[\w./-]+\.[A-Za-z0-9]{1,5}$', path):
+            continue
+        findings.append({"type":"exploit_available","title":parts[0],
+                          "path":"searchsploit match","severity":"high",
+                          "detail":parts[0],
+                          "command":f"searchsploit -m {path}"})
     return findings
 
 def parse_nikto(output):
@@ -1235,10 +1460,19 @@ def parse_nikto(output):
                               "path":path,"command":"nikto -h <target>"})
     return findings
 
+_SSL_NEG = re.compile(r'(?:\bnot\b|\bno\b|\bdisabled\b|<\s*not\b)', re.I)
+
 def parse_ssl(output):
+    """sslscan / openssl / testssl output.
+
+    Real sslscan 2.1.x prints ``SSLv2     disabled`` / ``SSLv3     disabled``
+    for protocols that are OFF, and ``TLSv1.x not vulnerable to heartbleed``
+    for checks that passed — neither is a finding. A line is only considered
+    when it makes an affirmative statement about a weak protocol/cipher/cert.
+    """
     findings = []
     for line in output.splitlines():
-        if _NEGATED_RESULT.search(line):
+        if _NEGATED_RESULT.search(line) or _SSL_NEG.search(line):
             continue
         ll = line.lower()
         if any(x in ll for x in ['sslv2','sslv3','tlsv1.0','tlsv1.1']):
@@ -2006,8 +2240,15 @@ def parse_db_privesc(output):
 
 def parse_sqlmap(output):
     findings = []
+    # sqlmap's own negative verdicts ("does not seem to be injectable",
+    # "all tested parameters do not appear to be injectable", …) must never
+    # become findings; usage/error text is skipped wholesale.
+    if re.search(r'^Usage: (?:python3 )?sqlmap', output, re.M):
+        return []
     # Detected injection type
     for line in output.splitlines():
+        if _NEGATED_RESULT.search(line):
+            continue
         ll = line.lower()
         # Injection confirmed lines
         if re.search(r'(parameter|place).*appears to be.*injectable|sqlmap identified.*injection point', line, re.I):
@@ -2103,7 +2344,7 @@ def parse_subdomains(output, sess):
     target = str(sess.get('target', ''))
     tgt = re.escape(target) if target else r'[a-z0-9.-]+'
     for line in output.splitlines():
-        m = re.search(r'(?i)([a-z0-9_-]+\.' + tgt + r')\s*->\s*([0-9.]+)', line)
+        m = re.search(r'(?i)([a-z0-9_.-]+\.' + tgt + r')\s*->\s*([0-9.]+)', line)
         if m:
             name, ip = m.group(1), m.group(2)
             if name in seen: continue
@@ -2121,6 +2362,56 @@ def parse_subdomains(output, sess):
                 "detail": f"dnsrecon A record: {name} -> {ip}",
                 "path": name, "command": f"dig +short {name} A"})
     return findings
+
+def parse_urls(output, sess):
+    """Reports URLs/endpoints actually discovered by crawling or declared in
+    robots.txt / sitemap.xml. Informational only: same-host URLs only, each one
+    was reached or explicitly listed; nothing is inferred and no placeholders
+    are emitted."""
+    findings = []
+    seen = set()
+    target = str((sess or {}).get('target', ''))
+    try:
+        base = _base_url(sess)
+    except Exception:
+        base = 'http://' + target if target else ''
+    host = re.sub(r'^https?://', '', base).split('/')[0].split(':')[0] if base else ''
+    for line in output.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        url = ''
+        m = re.search(r'https?://[^\s"\'<>]+', s)
+        if m:
+            url = m.group(0).rstrip('.,;)\'"')
+        else:
+            m = re.match(r'(?i)(?:Allow|Disallow|Sitemap|Location):\s*(\S+)', s)
+            if m:
+                p = m.group(1)
+                if p.startswith('http'):
+                    url = p
+                elif base:
+                    url = base.rstrip('/') + '/' + p.lstrip('/')
+        if not url or not url.startswith('http'):
+            continue
+        uhost = re.sub(r'^https?://', '', url).split('/')[0].split(':')[0]
+        if base:
+            host = re.sub(r'^https?://', '', base).split('/')[0].split(':')[0]
+            if uhost and uhost != host and not uhost.endswith('.' + host):
+                continue
+        key = url.rstrip('/')
+        if key in seen:
+            continue
+        seen.add(key)
+        path = re.sub(r'^https?://[^/]+', '', url) or '/'
+        findings.append({"type": "web_path", "severity": "info",
+            "detail": f"URL discovered: {url}",
+            "path": path,
+            "command": f"curl -sk {url}"})
+        if len(findings) >= 250:
+            break
+    return findings
+
 
 def parse_breach_osint(output, sess):
     """Breach findings require a real HIBP 200 breach response (COMPROMISED:).
@@ -2259,7 +2550,12 @@ def parse_version_cve(output, sess):
             ver = next((g for g in m.groups() if g), None)
             if not ver:
                 continue
-            ver = re.match(r'(\d+(?:\.\d+){1,3})', ver).group(1)
+            vm = re.match(r'(\d+(?:\.\d+){1,3})', ver)
+            if not vm:
+                # Single-component versions (e.g. "Jenkins 2") cannot form an
+                # exact-version CPE — skip instead of crashing on .group(1).
+                continue
+            ver = vm.group(1)
             nvd = _nvd_verify_cpe(f"{vend}:{prod}", ver)
             for c in nvd[:5]:
                 band = cvss31_band(c['score'])
@@ -2505,6 +2801,272 @@ def parse_cred_harvest(output):
             "command":"git clone http://<target>/.git /tmp/dumped_repo"})
     return findings
 
+# ─────────────────────────────────────────────────────────────────────────────
+# STANDARDS MAPPING — OWASP Top 10 (2021) + CWE per finding type, and MITRE
+# ATT&CK for authentication/session findings.
+#
+# Only *vulnerability* finding types carry a category. Informational findings
+# (open ports, fingerprints, paths, discovery) are deliberately unclassified —
+# assigning them an OWASP vulnerability category would be a fabricated claim.
+# Types whose class depends on the concrete signature (nuclei/msf/signature
+# matches, banner/timing anomalies) are marked "indeterminate" rather than
+# guessed. A unit test asserts every type the codebase can emit is covered by
+# exactly one bucket, so nothing silently falls through unmapped.
+# ─────────────────────────────────────────────────────────────────────────────
+STANDARDS = {
+    # A01 — Broken Access Control
+    "bola_idor":            ("A01:2021 - Broken Access Control", "CWE-639"),
+    "broken_function_auth": ("A01:2021 - Broken Access Control", "CWE-285"),
+    "mass_assignment":      ("A01:2021 - Broken Access Control", "CWE-915"),
+    "path_traversal":       ("A01:2021 - Broken Access Control", "CWE-22"),
+    "open_redirect":        ("A01:2021 - Broken Access Control", "CWE-601"),
+    "admin_panel":          ("A01:2021 - Broken Access Control", "CWE-284"),
+    "git_exposed":          ("A01:2021 - Broken Access Control", "CWE-538"),
+    "git_config_content":   ("A01:2021 - Broken Access Control", "CWE-538"),
+    "git_remote_exposed":   ("A01:2021 - Broken Access Control", "CWE-538"),
+    "env_exposed":          ("A01:2021 - Broken Access Control", "CWE-200"),
+    "sensitive_data_exposure": ("A01:2021 - Broken Access Control", "CWE-200"),
+    "redis_data_exposure":  ("A01:2021 - Broken Access Control", "CWE-200"),
+    "db_user_disclosed":    ("A01:2021 - Broken Access Control", "CWE-200"),
+    "db_exposed":           ("A01:2021 - Broken Access Control", "CWE-200"),
+    "db_excessive_priv":    ("A01:2021 - Broken Access Control", "CWE-269"),
+    "db_dba_privilege":     ("A01:2021 - Broken Access Control", "CWE-269"),
+    "smb_share":            ("A01:2021 - Broken Access Control", "CWE-200"),
+    # A02 — Cryptographic Failures
+    "weak_tls":             ("A02:2021 - Cryptographic Failures", "CWE-327"),
+    "weak_cipher":          ("A02:2021 - Cryptographic Failures", "CWE-327"),
+    "self_signed_cert":     ("A02:2021 - Cryptographic Failures", "CWE-295"),
+    "expired_cert":         ("A02:2021 - Cryptographic Failures", "CWE-298"),
+    "db_unencrypted_conn":  ("A02:2021 - Cryptographic Failures", "CWE-319"),
+    # A03 — Injection
+    "sql_injection":        ("A03:2021 - Injection", "CWE-89"),
+    "blind_sqli":           ("A03:2021 - Injection", "CWE-89"),
+    "sqli_technique":       ("A03:2021 - Injection", "CWE-89"),
+    "second_order_sqli":    ("A03:2021 - Injection", "CWE-89"),
+    "sqli_file_access":     ("A03:2021 - Injection", "CWE-89"),
+    "sqli_os_rce":          ("A03:2021 - Injection", "CWE-78"),
+    "nosql_injection":      ("A03:2021 - Injection", "CWE-943"),
+    "xss_reflected":        ("A03:2021 - Injection", "CWE-79"),
+    "host_header_injection": ("A03:2021 - Injection", "CWE-644"),
+    # A04 — Insecure Design
+    "missing_rate_limit":   ("A04:2021 - Insecure Design", "CWE-770"),
+    "verbose_error":        ("A04:2021 - Insecure Design", "CWE-209"),
+    "verbose_db_error":     ("A04:2021 - Insecure Design", "CWE-209"),
+    # A05 — Security Misconfiguration
+    "api_cors_wildcard":    ("A05:2021 - Security Misconfiguration", "CWE-942"),
+    "missing_headers":      ("A05:2021 - Security Misconfiguration", "CWE-693"),
+    "trace_method":         ("A05:2021 - Security Misconfiguration", "CWE-693"),
+    "cookie_flags":         ("A05:2021 - Security Misconfiguration", "CWE-1004"),
+    "header_anomaly":       ("A05:2021 - Security Misconfiguration", "CWE-693"),
+    "verbose_banner":       ("A05:2021 - Security Misconfiguration", "CWE-200"),
+    "xxe_injection":        ("A05:2021 - Security Misconfiguration", "CWE-611"),
+    "graphql_introspection": ("A05:2021 - Security Misconfiguration", "CWE-200"),
+    # A06 — Vulnerable and Outdated Components
+    "cve":                  ("A06:2021 - Vulnerable and Outdated Components", "CWE-1104"),
+    "version_eol":          ("A06:2021 - Vulnerable and Outdated Components", "CWE-1104"),
+    "version_outdated":     ("A06:2021 - Vulnerable and Outdated Components", "CWE-1104"),
+    "ssh_outdated":         ("A06:2021 - Vulnerable and Outdated Components", "CWE-1104"),
+    "legacy_os":            ("A06:2021 - Vulnerable and Outdated Components", "CWE-1104"),
+    "cms_vulnerability":    ("A06:2021 - Vulnerable and Outdated Components", "CWE-1104"),
+    "exploit_available":    ("A06:2021 - Vulnerable and Outdated Components", "CWE-1104"),
+    "protocol_vuln":        ("A06:2021 - Vulnerable and Outdated Components", "CWE-1104"),
+    "heartbleed":           ("A06:2021 - Vulnerable and Outdated Components", "CWE-125"),
+    # A07 — Identification and Authentication Failures
+    "broken_auth":          ("A07:2021 - Identification and Authentication Failures", "CWE-287"),
+    "null_session":         ("A07:2021 - Identification and Authentication Failures", "CWE-287"),
+    "unauth_endpoint":      ("A07:2021 - Identification and Authentication Failures", "CWE-306"),
+    "api_key_exposure":     ("A07:2021 - Identification and Authentication Failures", "CWE-798"),
+    "js_secret_leak":       ("A07:2021 - Identification and Authentication Failures", "CWE-798"),
+    "default_cred":         ("A07:2021 - Identification and Authentication Failures", "CWE-1392"),
+    "default_cred_http":    ("A07:2021 - Identification and Authentication Failures", "CWE-1392"),
+    "db_default_cred":      ("A07:2021 - Identification and Authentication Failures", "CWE-1392"),
+    "snmp_public":          ("A07:2021 - Identification and Authentication Failures", "CWE-1392"),
+    "redis_no_auth":        ("A07:2021 - Identification and Authentication Failures", "CWE-306"),
+    "db_unauth_access":     ("A07:2021 - Identification and Authentication Failures", "CWE-306"),
+    "ftp_anon":             ("A07:2021 - Identification and Authentication Failures", "CWE-287"),
+    "auth_timing_oracle":   ("A07:2021 - Identification and Authentication Failures", "CWE-208"),
+    "wp_user_enum":         ("A07:2021 - Identification and Authentication Failures", "CWE-204"),
+    "breach_exposure":      ("A07:2021 - Identification and Authentication Failures", "CWE-522"),
+    # A09 — Security Logging and Monitoring Failures
+    "db_no_audit_log":      ("A09:2021 - Security Logging and Monitoring Failures", "CWE-778"),
+    # A10 — Server-Side Request Forgery
+    "ssrf":                 ("A10:2021 - Server-Side Request Forgery", "CWE-918"),
+    "ssrf_lfi":             ("A10:2021 - Server-Side Request Forgery", "CWE-918"),
+    # ZDAY / misc
+    "s3_public_list":       ("A01:2021 - Broken Access Control", "CWE-732"),
+    # Registration / signup
+    "signup_enum":          ("A07:2021 - Identification and Authentication Failures", "CWE-204"),
+    "signup_verification_bypass": ("A07:2021 - Identification and Authentication Failures", "CWE-287"),
+    "signup_duplicate":     ("A04:2021 - Insecure Design", "CWE-362"),
+    "signup_password_policy": ("A07:2021 - Identification and Authentication Failures", "CWE-521"),
+    "signup_captcha":       ("A07:2021 - Identification and Authentication Failures", "CWE-804"),
+    "signup_mass_assign":   ("A01:2021 - Broken Access Control", "CWE-915"),
+    "signup_rate_limit":    ("A04:2021 - Insecure Design", "CWE-770"),
+    # Authentication / login flow
+    "login_enum":           ("A07:2021 - Identification and Authentication Failures", "CWE-204"),
+    "login_bruteforce":     ("A07:2021 - Identification and Authentication Failures", "CWE-307"),
+    "password_reset_flaw":  ("A07:2021 - Identification and Authentication Failures", "CWE-640"),
+    "mfa_bypass":           ("A07:2021 - Identification and Authentication Failures", "CWE-287"),
+    "remember_me":          ("A07:2021 - Identification and Authentication Failures", "CWE-539"),
+    "oauth_misconfig":      ("A07:2021 - Identification and Authentication Failures", "CWE-346"),
+    "logout_invalidation":  ("A07:2021 - Identification and Authentication Failures", "CWE-613"),
+    "concurrent_session":   ("A07:2021 - Identification and Authentication Failures", "CWE-384"),
+    # Session management
+    "session_entropy":      ("A07:2021 - Identification and Authentication Failures", "CWE-330"),
+    "session_fixation":     ("A07:2021 - Identification and Authentication Failures", "CWE-384"),
+    "jwt_weakness":         ("A07:2021 - Identification and Authentication Failures", "CWE-347"),
+    "session_timeout":      ("A07:2021 - Identification and Authentication Failures", "CWE-613"),
+    "csrf_missing":         ("A01:2021 - Broken Access Control", "CWE-352"),
+    # Authorization
+    "horiz_privesc":        ("A01:2021 - Broken Access Control", "CWE-639"),
+    "vert_privesc":         ("A01:2021 - Broken Access Control", "CWE-269"),
+    "function_level_auth":  ("A01:2021 - Broken Access Control", "CWE-285"),
+    # Input validation
+    "ssti":                 ("A03:2021 - Injection", "CWE-1336"),
+    "file_upload":          ("A04:2021 - Insecure Design", "CWE-434"),
+    "deserialization":      ("A08:2021 - Software and Data Integrity Failures", "CWE-502"),
+    "request_smuggling":    ("A04:2021 - Insecure Design", "CWE-444"),
+    # Business logic
+    "price_manipulation":   ("A04:2021 - Insecure Design", "CWE-840"),
+    "workflow_bypass":      ("A04:2021 - Insecure Design", "CWE-841"),
+    "ato_chain":            ("A07:2021 - Identification and Authentication Failures", "CWE-287"),
+    "multi_tenancy":        ("A01:2021 - Broken Access Control", "CWE-639"),
+    # API-specific
+    "graphql_abuse":        ("A04:2021 - Insecure Design", "CWE-770"),
+    "graphql_field_auth":   ("A01:2021 - Broken Access Control", "CWE-285"),
+    "mobile_api_reuse":     ("A01:2021 - Broken Access Control", "CWE-284"),
+}
+
+# classification depends on the concrete match — never guessed
+STANDARDS_INDETERMINATE = {
+    "signature_match", "nuclei_finding", "msf_finding",
+    "banner_anomaly", "timing_anomaly",
+}
+
+# recon / discovery / telemetry — not a vulnerability class by itself
+INFORMATIONAL_TYPES = {
+    "open_port", "os_detect", "tech_fingerprint", "waf_detected", "subdomain",
+    "email_discovered", "ad_enum", "db_fingerprint", "db_enumerated",
+    "web_path", "web_finding", "api_endpoint", "js_endpoint",
+    "sourcemap_exposed", "cloud_provider", "cloud_endpoint", "no_breach",
+    "evidence_capture", "not_tested", "info", "generic", "cmd", "stdout",
+    "meta", "error", "cms_wordpress", "cms_drupal", "cms_joomla",
+}
+
+# MITRE ATT&CK techniques for authentication / session / credential findings.
+ATTACK_BY_TYPE = {
+    "default_cred":        "T1078.001",
+    "default_cred_http":   "T1078.001",
+    "db_default_cred":     "T1078.001",
+    "snmp_public":         "T1078.001",
+    "broken_auth":         "T1078",
+    "null_session":        "T1078",
+    "unauth_endpoint":     "T1078",
+    "api_key_exposure":    "T1552.001",
+    "js_secret_leak":      "T1552.001",
+    "env_exposed":         "T1552.001",
+    "breach_exposure":     "T1589.001",
+    "cookie_flags":        "T1539",
+    "session_entropy":     "T1539",
+    "remember_me":         "T1539",
+    "session_fixation":    "T1550",
+    "wp_user_enum":        "T1087.002",
+    "auth_timing_oracle":  "T1087.002",
+    "login_enum":          "T1087.002",
+    "login_bruteforce":    "T1110",
+    "signup_rate_limit":   "T1110",
+    "jwt_weakness":        "T1550.001",
+    "oauth_misconfig":     "T1550",
+    "password_reset_flaw": "T1550",
+}
+
+# ATO chain contributors: attacker action → defender detection guidance.
+ATO_DETECTIONS = {
+    "bola_idor":       ("Enumerate object identifiers to read/write other users' records",
+                        "Per-object authorization failures in app logs (403/401 spikes per user id); alert when one principal touches many distinct object ids"),
+    "mass_assignment": ("Inject role/isAdmin/verified fields into profile update and re-auth",
+                        "Audit records where privilege attributes change via self-service endpoints; diff role fields against approval workflow"),
+    "broken_auth":     ("Forge/alter tokens (alg=none, null token, missing authz check) to assume another identity",
+                        "Auth middleware denials, token parse failures, impossible-travel between principal and token claims"),
+    "null_session":    ("Present null/empty session to bypass authentication on protected routes",
+                        "Requests to protected routes with empty/invalid session ids; 401/200 anomaly by route"),
+    "password_reset_flaw":("Guess/reuse password-reset tokens then take over the account",
+                        "Reset-token reuse, wrong-token attempts, resets initiated for high-value accounts from new ASNs"),    "api_key_exposure":("Reuse a leaked API key/token to authenticate as the victim",
+                        "Use of revoked/unknown key ids; key used from new IP/user-agent; key enumeration attempts"),
+    "js_secret_leak":  ("Extract embedded secrets from JS bundles and call the backend as the app",
+                        "Static-scan noise aside: track calls using client-embedded key material; rotate on exposure"),
+    "env_exposed":     ("Read .env/config for DB/API credentials then authenticate directly",
+                        "Direct DB/admin access from web tier IPs; config file requests in access logs"),
+    "session_fixation":("Fixate a session id pre-auth, victim logs in, attacker reuses the id",
+                        "Session id observed before and after authentication for the same client"),
+    "login_bruteforce":("Password-spray a valid username list until one succeeds",
+                        "Many failed logins per account/IP, distributed source spray, success-after-many-failures"),
+    "login_enum":      ("Enumerate valid usernames via error/timing/registration/reset differences",
+                        "User-not-found response skew, enumeration patterns across reset/registration endpoints"),
+}
+
+ACCOUNT_FIELDS = ("role", "username", "password", "cookie", "token")
+MAX_ACCOUNTS = 8
+
+
+def _norm_accounts(raw):
+    """Sanitize operator-supplied role accounts. Kept in memory only — never
+    written to disk, never included in /status or the report."""
+    out = []
+    if not isinstance(raw, list):
+        return out
+    for a in raw[:MAX_ACCOUNTS]:
+        if not isinstance(a, dict):
+            continue
+        rec = {}
+        for k in ACCOUNT_FIELDS:
+            v = a.get(k)
+            if isinstance(v, str) and v.strip():
+                rec[k] = v.strip()
+        if not (rec.get("role") or rec.get("username")):
+            continue
+        rec["role"] = (rec.get("role") or "user").lower()
+        out.append(rec)
+    return out
+
+
+def _has_creds_for(sess, roles=None):
+    """True when the session has at least one account for the requested role(s)."""
+    accts = sess.get("accounts") or []
+    if not accts:
+        return False
+    if not roles:
+        return True
+    have = {(a.get("role") or "").lower() for a in accts}
+    return bool(have & {r.lower() for r in roles})
+
+
+def classify_standards(f):
+    """Attach OWASP 2021 + CWE (+ ATT&CK where applicable) to a finding.
+    Vulnerability types get a definite class; informational and signature-
+    dependent types are marked honestly instead of being given a fake class."""
+    t = f.get("type")
+    if t in STANDARDS:
+        ow, cw = STANDARDS[t]
+        f["owasp"], f["cwe"] = ow, cw
+        if t in ATTACK_BY_TYPE:
+            f["attack"] = ATTACK_BY_TYPE[t]
+        if t in ATO_DETECTIONS:
+            action, detect = ATO_DETECTIONS[t]
+            f["ato"] = {"action": action, "detection": detect}
+    elif t in STANDARDS_INDETERMINATE:
+        f["owasp"], f["cwe"] = None, None
+        f["standards_note"] = "classification depends on the matched signature — verify per evidence"
+    else:
+        # informational (or not yet classified) — no vulnerability claim
+        f["owasp"], f["cwe"] = None, None
+        if t in INFORMATIONAL_TYPES or f.get("severity") == "info":
+            f["standards_note"] = "informational — no vulnerability classification"
+        else:
+            f["standards_note"] = "unclassified"
+    return f
+
+
 def _normalize_findings(findings, sess, sub_id):
     """Real-target normalization: findings must reference the user's actual
     target and the command that actually ran — never <target> placeholders,
@@ -2528,8 +3090,13 @@ def _normalize_findings(findings, sess, sub_id):
         pth = f.get('path')
         if isinstance(pth, str) and re.search(r'<[^<>\n]{1,60}>', pth):
             f['path'] = '-'
+        if isinstance(f.get('role'), str):
+            f['role'] = f['role'].lower()[:32]
+        else:
+            f.pop('role', None)
         score_finding(f)        # CVSS v3.1 vector + base score (choke point)
         _triage_finding(f)      # automated false-positive verdict (choke point)
+        classify_standards(f)   # OWASP 2021 / CWE / ATT&CK (choke point)
     _append_triage_log(sess, sub_id, findings)
     return findings
 
@@ -2552,6 +3119,7 @@ def dispatch_parser(parse_type, output, sess):
         "cms_scan": parse_cms_scan,
         "cred_harvest": parse_cred_harvest,
         "subdomains": parse_subdomains,
+        "urls": parse_urls,
         "breach_osint": parse_breach_osint,
         "js_leak": parse_js_leak,
         "version_cve": parse_version_cve,
@@ -2600,7 +3168,8 @@ LONG_SUBSTAGE_TIMEOUT = {
     "ep_hydra": 1800,
     "ep_msf_check": 1200,
     "ep_sqli_verify": 2400,
-    "recon_subdomains": 900,
+    "recon_subdomains": 1200,
+    "recon_urls": 600,
     "recon_osint_passive": 300,
     "recon_breach_osint": 900,
     "recon_js_leak": 480,
@@ -2743,6 +3312,958 @@ def _run_evidence_capture(sid, sub_id, sub):
     _advance_chain(sid, sub_id)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTH-TIER IN-PROCESS ENGINE
+#
+# Registration / authentication / session / authorization / business-logic
+# checks run in Python rather than as shell templates: operator credentials
+# never touch a command line, shell history, the process table or the report,
+# and response comparison (enumeration, lockout, token reuse) is exact instead
+# of parsed from curl text. Every finding cites the concrete request that
+# produced it and is gated on observed evidence — no response pattern, no
+# finding. Active probes are bounded and rate-capped.
+# ─────────────────────────────────────────────────────────────────────────────
+import ssl as _ssl
+import urllib.error as _urlerror
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Return the 3xx response itself instead of following it."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_SSL_CTX = _ssl.create_default_context()
+_SSL_CTX.check_hostname = False
+_SSL_CTX.verify_mode = _ssl.CERT_NONE
+_PW_OPENER = urllib.request.build_opener(
+    _NoRedirectHandler, urllib.request.HTTPSHandler(context=_SSL_CTX))
+
+
+SIGNUP_PATHS = ['/register', '/signup', '/sign-up', '/join', '/create-account',
+                '/account/register', '/users/register', '/auth/register',
+                '/api/register', '/api/signup', '/api/v1/register', '/user/new']
+LOGIN_PATHS = ['/login', '/signin', '/sign-in', '/auth/login', '/api/login',
+               '/api/auth/login', '/api/v1/login', '/session', '/account/login']
+_FORM_INPUT_RE = re.compile(r'<(?:input|select|textarea)[^>]*name=["\']([^"\']+)["\']', re.I)
+_FORM_ACTION_RE = re.compile(r'<form[^>]*action=["\']([^"\']*)["\']', re.I)
+_PW_FIELD_RE = re.compile(r'<input[^>]*type=["\']password["\']', re.I)
+_CAPTCHA_RE = re.compile(r'recaptcha|hcaptcha|turnstile|grecaptcha|cf-turnstile|data-sitekey', re.I)
+_EXISTS_RE = re.compile(r'already\s+(?:registered|exists|taken|in use|been)|is taken|'
+                        r'(?:email|username|account)\s+(?:already\s+)?exists|in use|duplicate', re.I)
+_POLICY_RE = re.compile(r'too\s+short|at least|minimum|weak password|password must|'
+                        r'complexity|characters|special character', re.I)
+_VERIFY_RE = re.compile(r'verif|confirm your (?:email|account)|activation|'
+                        r'check your (?:email|inbox)|activate your', re.I)
+
+
+def _http(method, url, data=None, headers=None, timeout=7, cookie=None,
+          json_body=None, max_bytes=262144):
+    """One HTTP request, redirects NOT followed. Returns
+    {ok,status,headers(lowercased),body,url,error}. Never raises."""
+    h = dict(headers or {})
+    h.setdefault('User-Agent', 'PWM-AuthScan/1.0')
+    body = None
+    if json_body is not None:
+        body = json.dumps(json_body).encode()
+        h.setdefault('Content-Type', 'application/json')
+    elif data is not None:
+        body = urllib.parse.urlencode(data).encode()
+        h.setdefault('Content-Type', 'application/x-www-form-urlencoded')
+    if cookie:
+        h['Cookie'] = cookie
+    req = urllib.request.Request(url, data=body, headers=h, method=method.upper())
+    try:
+        with _PW_OPENER.open(req, timeout=timeout) as r:
+            raw = r.read(max_bytes)
+            return {"ok": True, "status": r.status,
+                    "headers": {k.lower(): v for k, v in r.headers.items()},
+                    "body": raw.decode('utf-8', 'ignore'), "url": r.geturl(), "error": None}
+    except _urlerror.HTTPError as e:
+        raw = b''
+        try:
+            raw = e.read(max_bytes)
+        except Exception:
+            pass
+        return {"ok": True, "status": e.code,
+                "headers": {k.lower(): v for k, v in (e.headers or {}).items()},
+                "body": raw.decode('utf-8', 'ignore'), "url": url, "error": None}
+    except Exception as e:
+        return {"ok": False, "status": None, "headers": {}, "body": "",
+                "url": url, "error": str(e)[:120]}
+
+
+def _base_url(sess):
+    o = sess.get('web_origin')
+    if o:
+        return o.rstrip('/')
+    ctx = sess.get('context') or {}
+    if ctx.get('web_base'):
+        return ctx['web_base'].rstrip('/')
+    t = sess.get('target', '')
+    if t.startswith('http'):
+        return t.rstrip('/')
+    ports = [p.strip() for p in str(sess.get('ports_found') or '').split(',') if p.strip().isdigit()]
+    if '443' in ports or '8443' in ports:
+        return f"https://{t}"
+    if '80' in ports:
+        return f"http://{t}"
+    for p in ports:
+        if p not in ('22', '23', '25', '53', '110', '143', '445', '3306',
+                     '5432', '6379', '27017'):
+            return f"http://{t}:{p}"
+    return f"http://{t}"
+
+
+def _req_line(method, url, data=None, secret_keys=('password', 'pass', 'pwd')):
+    if data:
+        safe = {k: ('***' if any(s in k.lower() for s in secret_keys) else v)
+                for k, v in data.items()}
+        return f"{method} {url} {urllib.parse.urlencode(safe)[:200]}"
+    return f"{method} {url}"
+
+
+def _resp_cookie(resp):
+    sc = (resp.get('headers') or {}).get('set-cookie')
+    return sc.split(';')[0] if sc else None
+
+
+def _norm_body(b):
+    return re.sub(r'\s+', ' ', re.sub(r'\d+', '#', b or '')).strip()[:2000]
+
+
+def _classify_signup(body):
+    return bool(_PW_FIELD_RE.search(body)) or bool(
+        re.search(r'\b(sign\s*up|register|create.{0,12}account|join)\b', body or '', re.I))
+
+
+def _finish_inproc(sid, sub_id, findings, lines):
+    sess = sessions.get(sid)
+    if sess is None:
+        return
+    for ln, typ in lines:
+        push(sid, "output", {"substage": sub_id, "line": ln, "type": typ})
+    _normalize_findings(findings, sess, sub_id)
+    sess.setdefault('findings', {})[sub_id] = findings
+    if sub_id not in sess['completed']:
+        sess['completed'].append(sub_id)
+    push(sid, "completed", {"substage": sub_id, "findings": findings,
+                            "finding_count": len(findings), "rc": 0})
+    _advance_chain(sid, sub_id)
+
+
+def _context(sess):
+    return sess.setdefault('context', {})
+
+
+def _signup_body(fields, tag, extra=None):
+    fields = fields or ['username', 'email', 'password']
+    body = {}
+    for f in fields:
+        fl = f.lower()
+        if 'confirm' in fl or 'pass' in fl:
+            body[f] = 'PwmProbe!23x'
+        elif 'email' in fl or 'mail' in fl:
+            body[f] = f'pwm-probe-{tag}@example.invalid'
+        elif 'user' in fl or 'name' in fl or 'login' in fl:
+            body[f] = f'pwmprobe{tag}'
+        else:
+            body[f] = f'pwm{tag}'
+    if extra:
+        body.update(extra)
+    return body
+
+
+def _reg_discovery(sid, sub_id, sub):
+    sess = sessions[sid]; base = _base_url(sess); ctx = _context(sess)
+    findings, lines = [], []
+    found = None
+    for p in SIGNUP_PATHS:
+        r = _http('GET', base + p)
+        if not r['ok'] or r['status'] not in (200, 405):
+            continue
+        if r['status'] == 405:
+            fields, pw, captcha = [], False, False
+        else:
+            if not _classify_signup(r['body']):
+                continue
+            fields = sorted(set(_FORM_INPUT_RE.findall(r['body'])))
+            pw = bool(_PW_FIELD_RE.search(r['body']))
+            captcha = bool(_CAPTCHA_RE.search(r['body']))
+        action = p
+        m = _FORM_ACTION_RE.search(r['body'] or '')
+        if m and m.group(1):
+            action = m.group(1)
+        url = action if action.startswith('http') else (
+            base + action if action.startswith('/') else base + '/' + action.lstrip('/'))
+        if not fields and pw:
+            fields = ['username', 'email', 'password']
+        found = {"url": url, "path": p, "fields": fields, "status": r['status'], "captcha": captcha}
+        lines.append((f"[signup] candidate {p} → {url} "
+                      f"(fields: {', '.join(fields) or 'n/a'}; captcha: {captcha})", "info"))
+        findings.append({"type": "web_path", "severity": "info", "path": p,
+                         "detail": f"Registration/signup endpoint discovered at {p}"
+                                   + (f" (form fields: {', '.join(fields)})" if fields else ""),
+                         "command": _req_line('GET', base + p)})
+        break
+    if found:
+        ctx['signup'] = found
+    else:
+        lines.append(("[signup] no registration endpoint discovered on common paths", "meta"))
+        findings.append({"type": "not_tested", "severity": "info", "path": "-",
+                         "detail": "No registration/signup endpoint discovered on common paths — "
+                                   "signup checks not applicable (nothing inferred).", "command": ""})
+    _finish_inproc(sid, sub_id, findings, lines)
+
+
+def _reg_captcha(sid, sub_id, sub):
+    sess = sessions[sid]; ctx = _context(sess)
+    sup = ctx.get('signup'); findings, lines = [], []
+    if not sup:
+        findings.append({"type": "not_tested", "severity": "info", "path": "-",
+                         "detail": "No signup endpoint discovered — CAPTCHA check not applicable.",
+                         "command": ""})
+    elif sup.get('captcha'):
+        lines.append(("[signup] CAPTCHA challenge detected on the registration form", "info"))
+        findings.append({"type": "info", "severity": "info", "path": sup['path'],
+                         "detail": "CAPTCHA challenge (reCAPTCHA/hCaptcha/Turnstile) present on the "
+                                   "registration form — automated abuse is challenged.",
+                         "command": _req_line('GET', sup['url'])})
+    else:
+        lines.append(("[signup] no CAPTCHA marker on the registration form", "meta"))
+        findings.append({"type": "signup_captcha", "severity": "low", "path": sup['path'],
+                         "detail": "Registration form has no CAPTCHA challenge — automated mass "
+                                   "account creation is not front-line challenged (CWE-804).",
+                         "command": _req_line('GET', sup['url'])})
+    _finish_inproc(sid, sub_id, findings, lines)
+
+
+def _reg_enum(sid, sub_id, sub):
+    sess = sessions[sid]; ctx = _context(sess)
+    sup = ctx.get('signup'); findings, lines = [], []
+    if not sup:
+        findings.append({"type": "not_tested", "severity": "info", "path": "-",
+                         "detail": "No signup endpoint discovered — enumeration check not applicable.",
+                         "command": ""})
+        _finish_inproc(sid, sub_id, findings, lines); return
+    tag = uuid.uuid4().hex[:10]
+    body = _signup_body(sup.get('fields'), tag)
+    r_new = _http('POST', sup['url'], data=body)
+    r_dup = _http('POST', sup['url'], data=body)
+    lines.append((f"[signup] probe new → HTTP {r_new['status']}", "info"))
+    lines.append((f"[signup] probe duplicate → HTTP {r_dup['status']}", "info"))
+    distinct = (r_new['status'] != r_dup['status']) or (_norm_body(r_new['body']) != _norm_body(r_dup['body']))
+    if r_new['status'] in (200, 201):
+        ctx['created'] = {"body": body, "cookie": _resp_cookie(r_new),
+                          "resp_body": r_new['body'], "status": r_new['status']}
+    if r_new['status'] in (200, 201) and distinct and _EXISTS_RE.search(r_dup['body'] or ''):
+        findings.append({"type": "signup_enum", "severity": "medium", "path": sup['path'],
+                         "detail": "Registration responses distinguish an existing account from a new "
+                                   "one (duplicate submission returned a distinct 'already exists' "
+                                   "response) — username/email enumeration vector.",
+                         "command": _req_line('POST', sup['url'], body)})
+    else:
+        lines.append(("[signup] no distinguishing response between new vs existing account", "meta"))
+    _finish_inproc(sid, sub_id, findings, lines)
+
+
+def _reg_password_policy(sid, sub_id, sub):
+    sess = sessions[sid]; ctx = _context(sess)
+    sup = ctx.get('signup'); findings, lines = [], []
+    if not sup:
+        findings.append({"type": "not_tested", "severity": "info", "path": "-",
+                         "detail": "No signup endpoint discovered — password-policy check not applicable.",
+                         "command": ""})
+        _finish_inproc(sid, sub_id, findings, lines); return
+    body = _signup_body(sup.get('fields'), uuid.uuid4().hex[:10])
+    for k in list(body):
+        if 'pass' in k.lower():
+            body[k] = '123456'
+    r = _http('POST', sup['url'], data=body)
+    lines.append((f"[signup] weak-password probe → HTTP {r['status']}", "info"))
+    if (r['status'] in (200, 201) and not _POLICY_RE.search(r['body'] or '')
+            and not _EXISTS_RE.search(r['body'] or '')):
+        findings.append({"type": "signup_password_policy", "severity": "medium", "path": sup['path'],
+                         "detail": "Registration accepted the weak password '123456' — no effective "
+                                   "password-strength policy enforced at signup (CWE-521).",
+                         "command": _req_line('POST', sup['url'], body)})
+    else:
+        lines.append(("[signup] weak password rejected or policy response observed", "meta"))
+    _finish_inproc(sid, sub_id, findings, lines)
+
+
+def _reg_verification_bypass(sid, sub_id, sub):
+    sess = sessions[sid]; ctx = _context(sess)
+    sup = ctx.get('signup'); created = ctx.get('created')
+    findings, lines = [], []
+    if not sup or not created:
+        findings.append({"type": "not_tested", "severity": "info", "path": "-",
+                         "detail": "No account was created during probing — email-verification-bypass "
+                                   "check not applicable (nothing inferred).", "command": ""})
+    elif created.get('cookie') and _VERIFY_RE.search(created.get('resp_body') or ''):
+        findings.append({"type": "signup_verification_bypass", "severity": "high", "path": sup['path'],
+                         "detail": "Registration issued an authenticated session cookie while the "
+                                   "response simultaneously asks for email verification — the account "
+                                   "is usable before verification completes.",
+                         "command": _req_line('POST', sup['url'], created['body'])})
+    else:
+        lines.append(("[signup] registration did not return a session alongside a verification notice",
+                      "meta"))
+    _finish_inproc(sid, sub_id, findings, lines)
+
+
+def _reg_mass_assign(sid, sub_id, sub):
+    sess = sessions[sid]; ctx = _context(sess)
+    sup = ctx.get('signup'); findings, lines = [], []
+    if not sup:
+        findings.append({"type": "not_tested", "severity": "info", "path": "-",
+                         "detail": "No signup endpoint discovered — signup mass-assignment check not applicable.",
+                         "command": ""})
+        _finish_inproc(sid, sub_id, findings, lines); return
+    extra = {'role': 'admin', 'isAdmin': 'true', 'admin': 'true'}
+    body = _signup_body(sup.get('fields'), uuid.uuid4().hex[:10], extra=extra)
+    r = _http('POST', sup['url'], data=body)
+    lines.append((f"[signup] overpost probe (role/isAdmin/admin) → HTTP {r['status']}", "info"))
+    if r['status'] in (200, 201) and re.search(
+            r'"?(?:role|isAdmin|is_admin|admin)"?\s*[:=]\s*"?(?:admin|true|1)"?',
+            r['body'] or '', re.I):
+        findings.append({"type": "signup_mass_assign", "severity": "high", "path": sup['path'],
+                         "detail": "Registration response reflected an injected privileged attribute "
+                                   "(role/isAdmin/admin) — overposting accepted at signup (CWE-915).",
+                         "command": _req_line('POST', sup['url'], body)})
+    else:
+        lines.append(("[signup] no privileged attribute reflected in the registration response", "meta"))
+    _finish_inproc(sid, sub_id, findings, lines)
+
+
+def _reg_rate_limit(sid, sub_id, sub):
+    sess = sessions[sid]; ctx = _context(sess)
+    sup = ctx.get('signup'); findings, lines = [], []
+    if not sup:
+        findings.append({"type": "not_tested", "severity": "info", "path": "-",
+                         "detail": "No signup endpoint discovered — rate-limit check not applicable.",
+                         "command": ""})
+        _finish_inproc(sid, sub_id, findings, lines); return
+    # reuse ONE probe identity so no additional accounts are created
+    body = _signup_body(sup.get('fields'), uuid.uuid4().hex[:10])
+    throttled = 0; had_response = False; attempts = 6
+    for _ in range(attempts):
+        r = _http('POST', sup['url'], data=body, timeout=5)
+        if r['ok']:
+            had_response = True
+        if r['status'] == 429 or (not r['ok'] and r['status'] is None):
+            throttled += 1
+    lines.append((f"[signup] {attempts} rapid attempts, throttled={throttled}", "info"))
+    if had_response and throttled == 0:
+        findings.append({"type": "signup_rate_limit", "severity": "medium", "path": sup['path'],
+                         "detail": f"No rate limiting observed across {attempts} rapid registration "
+                                   f"attempts (no 429/block) — mass account-creation abuse is unrestricted "
+                                   f"(CWE-770).",
+                         "command": _req_line('POST', sup['url'], body)})
+    else:
+        lines.append(("[signup] throttling/blocking observed or endpoint unreachable", "meta"))
+    _finish_inproc(sid, sub_id, findings, lines)
+
+
+RESET_PATHS = ['/forgot-password', '/forgot', '/password/reset', '/reset-password',
+               '/account/recover', '/password/forgot', '/api/forgot-password',
+               '/api/password/reset']
+OAUTH_PATHS = ['/oauth/authorize', '/oauth2/authorize', '/authorize',
+               '/auth/oauth/authorize', '/login/oauth/authorize']
+LOGOUT_PATHS = ['/logout', '/signout', '/sign-out', '/api/logout', '/api/auth/logout']
+PROTECTED_PATHS = ['/api/me', '/account', '/profile', '/dashboard', '/api/v1/me', '/user/profile']
+_LOCKOUT_RE = re.compile(r'locked|too many|try again later|rate limit|please wait|account disabled', re.I)
+_ENUM_UNKNOWN_RE = re.compile(r'unknown|not found|no such|invalid (?:user|account|login)|'
+                              r'does not exist|user does not', re.I)
+_ENUM_WRONGPW_RE = re.compile(r'incorrect password|wrong password|invalid password|'
+                              r'password is incorrect|bad credentials', re.I)
+_JWT_RE = re.compile(r'^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+$')
+ADMIN_PATHS = ['/admin', '/admin/', '/admin/users', '/admin/settings', '/administrator',
+               '/manage', '/console', '/api/admin', '/api/admin/users', '/api/users',
+               '/api/v1/users', '/api/user/list']
+OBJECT_PATH_TMPL = ['/api/user/{id}', '/api/users/{id}', '/api/v1/users/{id}',
+                    '/api/accounts/{id}', '/api/orders/{id}', '/api/profile/{id}']
+_ADMIN_MARKER_RE = re.compile(
+    r'"?(?:role|admin|superuser|isAdmin)"?\s*[:=]|'
+    r'\b(?:admin dashboard|user management|manage users|settings)\b|'
+    r'<title>[^<]*(?:admin|dashboard|管理)[^<]*</title>', re.I)
+_CSRF_FIELD_RE = re.compile(r'csrf|xsrf|_token|authenticity|anticsrf|nonce', re.I)
+
+
+def _build_login(lg, user, password):
+    body = {}
+    for f in (lg.get('fields') or ['username', 'password']):
+        fl = f.lower()
+        if 'pass' in fl:
+            body[f] = password
+        elif any(k in fl for k in ('otp', 'mfa', '2fa', 'code', 'token', 'captcha')):
+            body[f] = '000000'
+        else:
+            body[f] = user
+    return body
+
+
+def _operator_creds(sess):
+    for a in (sess.get('accounts') or []):
+        if a.get('username') and a.get('password'):
+            return a
+    return None
+
+
+def _probe_identity(sess):
+    ctx = _context(sess); lg = ctx.get('login') or {}
+    cr = ctx.get('created') or {}; b = cr.get('body') or {}
+    for lf in (lg.get('fields') or []):
+        if lf in b and 'pass' not in lf.lower():
+            return b[lf]
+    for k, v in b.items():
+        if 'pass' not in k.lower():
+            return v
+    ac = _operator_creds(sess)
+    return (ac.get('username') if ac else None)
+
+
+def _other_identity(sess):
+    """A second, distinct principal if one is known (e.g. a signup probe)."""
+    ctx = _context(sess); cr = ctx.get('created') or {}; b = cr.get('body') or {}
+    op = _operator_creds(sess)
+    opname = str(op.get('username')) if op else None
+    for key in ('username', 'user', 'login', 'login_name', 'email'):
+        if b.get(key) and str(b[key]) != opname:
+            return str(b[key])
+    for k, v in b.items():
+        if 'pass' not in k.lower() and v and str(v) != opname:
+            return str(v)
+    return None
+
+
+def _login_cookie(sess, base, lg, ac):
+    r = _http('POST', lg['url'], data=_build_login(lg, ac['username'], ac['password']))
+    return _resp_cookie(r)
+
+
+def _login_raw(sess, base, lg, ac):
+    r = _http('POST', lg['url'], data=_build_login(lg, ac['username'], ac['password']))
+    return (r['headers'] or {}).get('set-cookie', '')
+
+
+def _authz_forced_browsing(sid, sub_id, sub):
+    sess = sessions[sid]; base = _base_url(sess); findings, lines = [], []
+    for p in ADMIN_PATHS:
+        r = _http('GET', base + p)
+        if not r['ok']:
+            continue
+        lines.append((f"[authz] unauthenticated GET {p} → HTTP {r['status']}", "info"))
+        body = r['body'] or ''
+        if (r['status'] == 200 and not _PW_FIELD_RE.search(body) and len(body) > 100
+                and _ADMIN_MARKER_RE.search(body)):
+            findings.append({"type": "unauth_endpoint", "severity": "high", "path": p,
+                             "detail": f"Privileged resource {p} returned HTTP 200 with "
+                                       f"administrative content to an unauthenticated request "
+                                       f"(no login redirect, no 401/403) — broken access control.",
+                             "command": _req_line('GET', base + p)})
+            break
+    if not findings:
+        lines.append(("[authz] no unauthenticated administrative exposure observed", "meta"))
+    _finish_inproc(sid, sub_id, findings, lines)
+
+
+def _authz_vertical(sid, sub_id, sub):
+    sess = sessions[sid]; base = _base_url(sess); ctx = _context(sess)
+    lg = ctx.get('login'); ac = _operator_creds(sess)
+    findings, lines = [], []
+    if not lg or not ac:
+        findings.append({"type": "not_tested", "severity": "info", "path": "-",
+                         "detail": "No login endpoint / operator account — vertical authorization "
+                                   "check not applicable.", "command": ""})
+        _finish_inproc(sid, sub_id, findings, lines); return
+    role = str(ac.get('role') or '').lower()
+    if role in ('admin', 'administrator', 'superuser', 'root'):
+        findings.append({"type": "not_tested", "severity": "info", "path": "-",
+                         "detail": "Operator account is privileged — non-admin escalation to "
+                                   "admin functions is not testable with this account.",
+                         "command": ""})
+        _finish_inproc(sid, sub_id, findings, lines); return
+    cookie = _login_cookie(sess, base, lg, ac)
+    if not cookie:
+        findings.append({"type": "not_tested", "severity": "info", "path": lg['path'],
+                         "detail": "Operator login did not yield a session — vertical authorization "
+                                   "check not applicable.", "command": ""})
+        _finish_inproc(sid, sub_id, findings, lines); return
+    for p in ADMIN_PATHS:
+        anon = _http('GET', base + p)
+        auth = _http('GET', base + p, cookie=cookie)
+        if not auth['ok']:
+            continue
+        lines.append((f"[authz] {p}: anon={anon['status']} auth({role})={auth['status']}", "info"))
+        if (anon['status'] in (401, 403, 302, 303) and auth['status'] == 200
+                and not _PW_FIELD_RE.search(auth['body'] or '')
+                and _ADMIN_MARKER_RE.search(auth['body'] or '')):
+            findings.append({"type": "function_level_auth", "severity": "high", "path": p,
+                             "detail": f"Administrative function {p} requires authentication but not "
+                                       f"the admin role: unauthenticated → HTTP {anon['status']}, while "
+                                       f"a non-admin ('{role}') session → HTTP 200 with admin content "
+                                       f"(CWE-285).",
+                             "command": _req_line('GET', base + p)})
+            break
+    if not findings:
+        lines.append(("[authz] no vertical privilege escalation observed", "meta"))
+    _finish_inproc(sid, sub_id, findings, lines)
+
+
+def _authz_idor(sid, sub_id, sub):
+    sess = sessions[sid]; base = _base_url(sess); ctx = _context(sess)
+    lg = ctx.get('login'); ac = _operator_creds(sess); other = _other_identity(sess)
+    findings, lines = [], []
+    if not lg or not ac:
+        findings.append({"type": "not_tested", "severity": "info", "path": "-",
+                         "detail": "No login endpoint / operator account — object-level authorization "
+                                   "check not applicable.", "command": ""})
+        _finish_inproc(sid, sub_id, findings, lines); return
+    if not other:
+        findings.append({"type": "not_tested", "severity": "info", "path": "-",
+                         "detail": "No second identity available (register a probe account or supply "
+                                   "a second account) — BOLA/IDOR comparison not performed.",
+                         "command": ""})
+        _finish_inproc(sid, sub_id, findings, lines); return
+    cookie = _login_cookie(sess, base, lg, ac)
+    if not cookie:
+        findings.append({"type": "not_tested", "severity": "info", "path": lg['path'],
+                         "detail": "Operator login did not yield a session — BOLA/IDOR check not "
+                                   "applicable.", "command": ""})
+        _finish_inproc(sid, sub_id, findings, lines); return
+    me = str(ac['username'])
+    for tmpl in OBJECT_PATH_TMPL:
+        own = _http('GET', base + tmpl.format(id=urllib.parse.quote(me)), cookie=cookie)
+        oth = _http('GET', base + tmpl.format(id=urllib.parse.quote(other)), cookie=cookie)
+        anon = _http('GET', base + tmpl.format(id=urllib.parse.quote(other)))
+        if not (own['ok'] and oth['ok']):
+            continue
+        lines.append((f"[authz] {tmpl}: own={own['status']} other={oth['status']} "
+                      f"anon={anon['status']}", "info"))
+        if (own['status'] == 200 and oth['status'] == 200 and anon['status'] in (401, 403)
+                and other in (oth['body'] or '')
+                and _norm_body(oth['body']) != _norm_body(own['body'])):
+            findings.append({"type": "bola_idor", "severity": "high", "path": tmpl,
+                             "detail": f"Authenticated as '{me}' but {tmpl.format(id=other)} returned "
+                                       f"another user's record (contains '{other}') although the "
+                                       f"endpoint is protected (unauthenticated → HTTP {anon['status']}) "
+                                       f"— broken object-level authorization (CWE-639).",
+                             "command": _req_line('GET', base + tmpl.format(id=other))})
+            break
+    if not findings:
+        lines.append(("[authz] no object-level authorization bypass observed", "meta"))
+    _finish_inproc(sid, sub_id, findings, lines)
+
+
+def _auth_discovery(sid, sub_id, sub):
+    sess = sessions[sid]; base = _base_url(sess); ctx = _context(sess)
+    findings, lines = [], []
+    found = None
+    for p in LOGIN_PATHS:
+        r = _http('GET', base + p)
+        if not r['ok'] or r['status'] not in (200, 405):
+            continue
+        if r['status'] == 200 and not _PW_FIELD_RE.search(r['body'] or ''):
+            continue
+        fields = sorted(set(_FORM_INPUT_RE.findall(r['body'] or ''))) if r['status'] == 200 else []
+        m = _FORM_ACTION_RE.search(r['body'] or '')
+        action = (m.group(1) if m and m.group(1) else p)
+        url = action if action.startswith('http') else (
+            base + action if action.startswith('/') else base + '/' + action.lstrip('/'))
+        mfa = bool(re.search(r'otp|mfa|2fa|one[- ]?time|authenticator code|verification code',
+                             r['body'] or '', re.I)) or any(
+            any(k in f.lower() for k in ('otp', 'mfa', '2fa')) for f in fields)
+        if not fields:
+            fields = ['username', 'password']
+        found = {"url": url, "path": p, "fields": fields, "mfa": mfa}
+        lines.append((f"[login] candidate {p} → {url} (fields: {', '.join(fields)}; mfa: {mfa})", "info"))
+        findings.append({"type": "web_path", "severity": "info", "path": p,
+                         "detail": f"Authentication/login endpoint discovered at {p}"
+                                   f" (form fields: {', '.join(fields)})",
+                         "command": _req_line('GET', base + p)})
+        break
+    if found:
+        ctx['login'] = found
+    else:
+        findings.append({"type": "not_tested", "severity": "info", "path": "-",
+                         "detail": "No login endpoint discovered on common paths — authentication "
+                                   "checks not applicable (nothing inferred).", "command": ""})
+    _finish_inproc(sid, sub_id, findings, lines)
+
+
+def _auth_enum(sid, sub_id, sub):
+    sess = sessions[sid]; ctx = _context(sess); lg = ctx.get('login')
+    findings, lines = [], []
+    if not lg:
+        findings.append({"type": "not_tested", "severity": "info", "path": "-",
+                         "detail": "No login endpoint discovered — enumeration check not applicable.",
+                         "command": ""})
+        _finish_inproc(sid, sub_id, findings, lines); return
+    known = _probe_identity(sess)
+    if not known:
+        findings.append({"type": "not_tested", "severity": "info", "path": "-",
+                         "detail": "No known account identity available (no registered probe and no "
+                                   "operator account) — login enumeration comparison not possible "
+                                   "(nothing inferred).", "command": ""})
+        _finish_inproc(sid, sub_id, findings, lines); return
+    pw = 'PwmWrong!999'
+    unknown = 'pwm-nosuch-' + uuid.uuid4().hex[:8]
+    rk = _http('POST', lg['url'], data=_build_login(lg, known, pw))
+    ru = _http('POST', lg['url'], data=_build_login(lg, unknown, pw))
+    lines.append((f"[login] known-user wrong-pw → HTTP {rk['status']}", "info"))
+    lines.append((f"[login] unknown-user wrong-pw → HTTP {ru['status']}", "info"))
+    distinct = (rk['status'] != ru['status']) or (_norm_body(rk['body']) != _norm_body(ru['body']))
+    if distinct and _ENUM_UNKNOWN_RE.search(ru['body'] or '') and _ENUM_WRONGPW_RE.search(rk['body'] or ''):
+        findings.append({"type": "login_enum", "severity": "medium", "path": lg['path'],
+                         "detail": "Login responses distinguish an unknown username ('not found') from a "
+                                   "known username with a wrong password ('incorrect password') — "
+                                   "account enumeration vector.",
+                         "command": _req_line('POST', lg['url'], _build_login(lg, unknown, pw))})
+    else:
+        lines.append(("[login] no distinguishing response between unknown vs known user", "meta"))
+    _finish_inproc(sid, sub_id, findings, lines)
+
+
+def _auth_lockout(sid, sub_id, sub):
+    sess = sessions[sid]; ctx = _context(sess); lg = ctx.get('login')
+    findings, lines = [], []
+    ident = _probe_identity(sess)
+    if not lg or not ident:
+        findings.append({"type": "not_tested", "severity": "info", "path": "-",
+                         "detail": "No login endpoint / known account identity available — login "
+                                   "lockout check not applicable (nothing inferred).", "command": ""})
+        _finish_inproc(sid, sub_id, findings, lines); return
+    attempts = 6; throttled = 0; responded = False
+    for i in range(attempts):
+        r = _http('POST', lg['url'], data=_build_login(lg, ident, f'PwmWrong!{i}x9'), timeout=5)
+        if r['ok']:
+            responded = True
+        if r['status'] == 429 or _LOCKOUT_RE.search(r['body'] or ''):
+            throttled += 1
+    lines.append((f"[login] {attempts} wrong-password attempts, throttled={throttled}", "info"))
+    if responded and throttled == 0:
+        findings.append({"type": "login_bruteforce", "severity": "medium", "path": lg['path'],
+                         "detail": f"No account lockout or rate limiting across {attempts} consecutive "
+                                   f"wrong-password attempts for an existing account — online password "
+                                   f"guessing is unrestricted (CWE-307).",
+                         "command": _req_line('POST', lg['url'], _build_login(lg, ident, 'PwmWrong!0x9'))})
+    else:
+        lines.append(("[login] lockout/throttling observed or endpoint unreachable", "meta"))
+    _finish_inproc(sid, sub_id, findings, lines)
+
+
+def _auth_password_reset(sid, sub_id, sub):
+    sess = sessions[sid]; base = _base_url(sess); findings, lines = [], []
+    ident = _probe_identity(sess)
+    hit = None
+    for p in RESET_PATHS:
+        r = _http('GET', base + p)
+        if r['ok'] and r['status'] in (200, 405):
+            hit = p
+            break
+    if not hit:
+        findings.append({"type": "not_tested", "severity": "info", "path": "-",
+                         "detail": "No password-reset endpoint discovered — reset-flow check not applicable.",
+                         "command": ""})
+        _finish_inproc(sid, sub_id, findings, lines); return
+    if not ident:
+        findings.append({"type": "not_tested", "severity": "info", "path": hit,
+                         "detail": "No known account identity available — password-reset abuse check "
+                                   "not performed (nothing inferred).", "command": ""})
+        _finish_inproc(sid, sub_id, findings, lines); return
+    r = _http('POST', base + hit, data={'username': ident, 'email': ident})
+    lines.append((f"[reset] POST {hit} → HTTP {r['status']}", "info"))
+    tok = re.search(r'(?:[?&]token=|["\']token["\']\s*[:=]\s*["\']|reset\?token=|'
+                    r'code=)([A-Za-z0-9._-]{8,})', r['body'] or '')
+    if r['status'] in (200, 201) and tok:
+        findings.append({"type": "password_reset_flaw", "severity": "high", "path": hit,
+                         "detail": "Password-reset response discloses the reset token/link in the HTTP "
+                                   "body — an attacker who can trigger a reset for a victim can complete "
+                                   "it (CWE-640).",
+                         "command": _req_line('POST', base + hit, {'username': ident})})
+    else:
+        lines.append(("[reset] no reset token disclosed in the response", "meta"))
+    _finish_inproc(sid, sub_id, findings, lines)
+
+
+def _auth_oauth(sid, sub_id, sub):
+    sess = sessions[sid]; base = _base_url(sess); findings, lines = [], []
+    evil = 'https://pwm-evil.example/cb'
+    hit = None
+    for p in OAUTH_PATHS:
+        probe = f"{base}{p}?client_id=pwm&response_type=code&redirect_uri={urllib.parse.quote(evil)}"
+        r = _http('GET', probe)
+        if r['ok'] and r['status'] in (200, 302, 303):
+            loc = (r['headers'].get('location') or '')
+            lines.append((f"[oauth] GET {p} → HTTP {r['status']} location={loc[:80]}", "info"))
+            if 'pwm-evil.example' in loc:
+                findings.append({"type": "oauth_misconfig", "severity": "high", "path": p,
+                                 "detail": "OAuth authorize endpoint reflects an arbitrary redirect_uri "
+                                           "(pwm-evil.example) in the redirect Location without "
+                                           "validation — authorization-code / token theft (CWE-346).",
+                                 "command": _req_line('GET', probe)})
+                hit = p
+                break
+            hit = p
+    if not hit:
+        findings.append({"type": "not_tested", "severity": "info", "path": "-",
+                         "detail": "No OAuth/SSO authorize endpoint discovered — redirect_uri check not "
+                                   "applicable (nothing inferred).", "command": ""})
+    _finish_inproc(sid, sub_id, findings, lines)
+
+
+def _auth_logout(sid, sub_id, sub):
+    sess = sessions[sid]; base = _base_url(sess); ctx = _context(sess)
+    lg = ctx.get('login'); ac = _operator_creds(sess)
+    findings, lines = [], []
+    if not lg or not ac:
+        findings.append({"type": "not_tested", "severity": "info", "path": "-",
+                         "detail": "No login endpoint / operator account — logout invalidation check "
+                                   "not applicable.", "command": ""})
+        _finish_inproc(sid, sub_id, findings, lines); return
+    r = _http('POST', lg['url'], data=_build_login(lg, ac['username'], ac['password']))
+    cookie = _resp_cookie(r)
+    if not cookie:
+        findings.append({"type": "not_tested", "severity": "info", "path": lg['path'],
+                         "detail": "Login did not return a session cookie (token-based?) — logout "
+                                   "invalidation check not applicable.", "command": ""})
+        _finish_inproc(sid, sub_id, findings, lines); return
+    lopath = None
+    for p in LOGOUT_PATHS:
+        rr = _http('GET', base + p, cookie=cookie)
+        if rr['ok'] and rr['status'] in (200, 302, 303, 204):
+            lopath = p
+            break
+    if not lopath:
+        findings.append({"type": "not_tested", "severity": "info", "path": "-",
+                         "detail": "No logout endpoint discovered — session-invalidation check not "
+                                   "applicable.", "command": ""})
+        _finish_inproc(sid, sub_id, findings, lines); return
+    stale = None
+    for p in PROTECTED_PATHS:
+        rr = _http('GET', base + p, cookie=cookie)
+        if rr['ok'] and rr['status'] == 200 and _norm_body(rr['body']):
+            stale = p
+            break
+    lines.append((f"[logout] after GET {lopath}, stale cookie on {stale or 'none'}", "info"))
+    if stale:
+        findings.append({"type": "logout_invalidation", "severity": "medium", "path": lopath,
+                         "detail": f"Session cookie remains valid against {stale} after logout — the "
+                                   f"session is not invalidated server-side (CWE-613).",
+                         "command": _req_line('GET', base + lopath)})
+    else:
+        lines.append(("[logout] session invalidated server-side (stale cookie rejected)", "info"))
+    _finish_inproc(sid, sub_id, findings, lines)
+
+
+def _session_cookie_flags(sid, sub_id, sub):
+    sess = sessions[sid]; ctx = _context(sess); lg = ctx.get('login'); ac = _operator_creds(sess)
+    findings, lines = [], []
+    if not lg or not ac:
+        findings.append({"type": "not_tested", "severity": "info", "path": "-",
+                         "detail": "No login endpoint / operator account — cookie-flag check not applicable.",
+                         "command": ""})
+        _finish_inproc(sid, sub_id, findings, lines); return
+    r = _http('POST', lg['url'], data=_build_login(lg, ac['username'], ac['password']))
+    sc = (r['headers'] or {}).get('set-cookie', '')
+    if not sc:
+        findings.append({"type": "not_tested", "severity": "info", "path": lg['path'],
+                         "detail": "Login did not set a cookie (token/header session?) — cookie-flag "
+                                   "check not applicable.", "command": ""})
+        _finish_inproc(sid, sub_id, findings, lines); return
+    low = sc.lower(); missing = []
+    if 'httponly' not in low:
+        missing.append('HttpOnly')
+    if 'secure' not in low:
+        missing.append('Secure')
+    if 'samesite' not in low:
+        missing.append('SameSite')
+    lines.append((f"[session] Set-Cookie: {sc[:120]}", "info"))
+    if missing:
+        findings.append({"type": "cookie_flags", "severity": "low", "path": lg['path'],
+                         "detail": f"Session cookie missing flag(s): {', '.join(missing)} "
+                                   f"(observed Set-Cookie: {sc[:160]}) — susceptible to theft/CSRF (CWE-1004).",
+                         "command": _req_line('POST', lg['url'], _build_login(lg, ac['username'], '***'))})
+    else:
+        lines.append(("[session] session cookie sets HttpOnly, Secure and SameSite", "info"))
+    _finish_inproc(sid, sub_id, findings, lines)
+
+
+def _session_entropy(sid, sub_id, sub):
+    sess = sessions[sid]; ctx = _context(sess); lg = ctx.get('login'); ac = _operator_creds(sess)
+    findings, lines = [], []
+    if not lg or not ac:
+        findings.append({"type": "not_tested", "severity": "info", "path": "-",
+                         "detail": "No login endpoint / operator account — session-entropy check not applicable.",
+                         "command": ""})
+        _finish_inproc(sid, sub_id, findings, lines); return
+    vals = []
+    for _ in range(3):
+        r = _http('POST', lg['url'], data=_build_login(lg, ac['username'], ac['password']))
+        c = _resp_cookie(r)
+        if c and '=' in c:
+            vals.append(c.split('=', 1)[1])
+    if not vals:
+        findings.append({"type": "not_tested", "severity": "info", "path": lg['path'],
+                         "detail": "No session cookie value observed — entropy check not applicable.",
+                         "command": ""})
+        _finish_inproc(sid, sub_id, findings, lines); return
+    v = max(vals, key=len); charset = len(set(v))
+    lines.append((f"[session] {len(vals)} cookie(s); sample len={len(v)} charset={charset}", "info"))
+    if len(v) < 12 or charset < 8:
+        findings.append({"type": "session_entropy", "severity": "medium", "path": lg['path'],
+                         "detail": f"Session identifier appears low-entropy (length {len(v)}, "
+                                   f"{charset} distinct characters in sample) — predictable session ids "
+                                   f"enable hijacking (CWE-330).",
+                         "command": _req_line('POST', lg['url'], _build_login(lg, ac['username'], '***'))})
+    else:
+        lines.append(("[session] session id length/charset consistent with a random token", "info"))
+    _finish_inproc(sid, sub_id, findings, lines)
+
+
+def _session_fixation(sid, sub_id, sub):
+    sess = sessions[sid]; ctx = _context(sess); lg = ctx.get('login'); ac = _operator_creds(sess)
+    findings, lines = [], []
+    if not lg or not ac:
+        findings.append({"type": "not_tested", "severity": "info", "path": "-",
+                         "detail": "No login endpoint / operator account — session-fixation check not applicable.",
+                         "command": ""})
+        _finish_inproc(sid, sub_id, findings, lines); return
+    pre = _http('GET', lg['url'])
+    prec = _resp_cookie(pre)
+    r = _http('POST', lg['url'], data=_build_login(lg, ac['username'], ac['password']), cookie=prec)
+    postc = _resp_cookie(r)
+    lines.append((f"[session] pre-auth cookie={prec}; post-auth cookie={postc}", "info"))
+    if prec and postc and prec == postc:
+        findings.append({"type": "session_fixation", "severity": "high", "path": lg['path'],
+                         "detail": "Session identifier is not rotated on authentication (pre-auth cookie "
+                                   "equals post-auth cookie) — session fixation is possible (CWE-384).",
+                         "command": _req_line('POST', lg['url'], _build_login(lg, ac['username'], '***'))})
+    else:
+        lines.append(("[session] session id rotated (or no pre-auth cookie issued)", "info"))
+    _finish_inproc(sid, sub_id, findings, lines)
+
+
+def _session_jwt(sid, sub_id, sub):
+    sess = sessions[sid]; ctx = _context(sess); lg = ctx.get('login'); ac = _operator_creds(sess)
+    findings, lines = [], []
+    if not lg or not ac:
+        findings.append({"type": "not_tested", "severity": "info", "path": "-",
+                         "detail": "No login endpoint / operator account — JWT check not applicable.",
+                         "command": ""})
+        _finish_inproc(sid, sub_id, findings, lines); return
+    r = _http('POST', lg['url'], data=_build_login(lg, ac['username'], ac['password']))
+    c = _resp_cookie(r); val = c.split('=', 1)[1] if c and '=' in c else ''
+    if val and _JWT_RE.match(val):
+        try:
+            import base64 as _b64
+            hdr = json.loads(_b64.urlsafe_b64decode(val.split('.')[0] + '===').decode('utf-8', 'ignore'))
+        except Exception:
+            hdr = {}
+        alg = str(hdr.get('alg', ''))
+        lines.append((f"[session] JWT session token, alg={alg or 'unknown'}", "info"))
+        if alg.lower() in ('none', ''):
+            findings.append({"type": "jwt_weakness", "severity": "high", "path": lg['path'],
+                             "detail": f"Session JWT declares alg='{alg or 'none'}' (unsecured/absent) — "
+                                       f"signature can be stripped or forged (CWE-347).",
+                             "command": _req_line('POST', lg['url'], _build_login(lg, ac['username'], '***'))})
+        else:
+            findings.append({"type": "info", "severity": "info", "path": lg['path'],
+                             "detail": f"JWT-based session observed with alg='{alg}'; signature/secret "
+                                       f"strength not assessed here.", "command": _req_line('POST', lg['url'])})
+    else:
+        lines.append(("[session] no JWT-format session token observed (opaque cookie)", "meta"))
+    _finish_inproc(sid, sub_id, findings, lines)
+
+
+def _bizlogic_csrf(sid, sub_id, sub):
+    sess = sessions[sid]; base = _base_url(sess); ctx = _context(sess)
+    findings, lines = [], []
+    forms = []
+    if ctx.get('signup'):
+        forms.append(('signup', ctx['signup']))
+    if ctx.get('login'):
+        forms.append(('login', ctx['login']))
+    if not forms:
+        findings.append({"type": "not_tested", "severity": "info", "path": "-",
+                         "detail": "No state-changing form discovered — CSRF check not applicable.",
+                         "command": ""})
+        _finish_inproc(sid, sub_id, findings, lines); return
+    # cookie-based session? login (or a login GET) must set a cookie
+    raw = ''
+    lg = ctx.get('login'); ac = _operator_creds(sess)
+    if lg and ac:
+        raw = _login_raw(sess, base, lg, ac)
+    if not raw and lg:
+        raw = (_http('GET', lg['url'])['headers'] or {}).get('set-cookie', '')
+    cookie = raw.split(';')[0] if raw else None
+    same_site = bool(re.search(r';\s*samesite', raw, re.I))
+    for name, f in forms:
+        fields = f.get('fields') or []
+        has_token = any(_CSRF_FIELD_RE.search(x) for x in fields)
+        lines.append((f"[bizlogic] {name} form fields: {', '.join(fields)} "
+                      f"(anti-CSRF token: {has_token})", "info"))
+        if cookie and not has_token and not same_site:
+            findings.append({"type": "csrf_missing", "severity": "medium",
+                             "path": f.get('path', '-'),
+                             "detail": f"The {name} form ({f.get('path', '?')}) has no anti-CSRF "
+                                       f"token field and its session cookie has no SameSite attribute "
+                                       f"— cross-site requests can drive this action (CWE-352).",
+                             "command": _req_line('POST', f.get('url') or (base + f.get('path', '/')),
+                                                  {x: '...' for x in fields})})
+            break
+    if not findings:
+        lines.append(("[bizlogic] no CSRF weakness observed (token present or SameSite enforced)",
+                      "meta"))
+    _finish_inproc(sid, sub_id, findings, lines)
+
+
+def _bizlogic_workflow(sid, sub_id, sub):
+    sess = sessions[sid]; findings, lines = [], []
+    tested = []
+    ctx = _context(sess)
+    if ctx.get('signup'):
+        tested.append('signup')
+    if ctx.get('login'):
+        tested.append('login')
+    lines.append((f"[bizlogic] generic flows exercised: {', '.join(tested) or 'none'}", "info"))
+    findings.append({"type": "not_tested", "severity": "info", "path": "-",
+                     "detail": "Application-specific business logic (multi-step workflows, price/"
+                               "quantity manipulation, coupon/refund abuse, race conditions) cannot be "
+                               "verified generically without domain knowledge of the target's "
+                               "workflows; not tested to avoid fabricated findings.",
+                     "command": ""})
+    _finish_inproc(sid, sub_id, findings, lines)
+
+
+INPROC_SUBSTAGES = {
+    'reg_discovery': _reg_discovery,
+    'reg_captcha': _reg_captcha,
+    'reg_enum': _reg_enum,
+    'reg_password_policy': _reg_password_policy,
+    'reg_verification_bypass': _reg_verification_bypass,
+    'reg_mass_assign': _reg_mass_assign,
+    'reg_rate_limit': _reg_rate_limit,
+    'auth_discovery': _auth_discovery,
+    'auth_enum': _auth_enum,
+    'auth_lockout': _auth_lockout,
+    'auth_password_reset': _auth_password_reset,
+    'auth_oauth': _auth_oauth,
+    'auth_logout': _auth_logout,
+    'session_cookie_flags': _session_cookie_flags,
+    'session_entropy': _session_entropy,
+    'session_fixation': _session_fixation,
+    'session_jwt': _session_jwt,
+    'authz_forced_browsing': _authz_forced_browsing,
+    'authz_vertical': _authz_vertical,
+    'authz_idor': _authz_idor,
+    'bizlogic_csrf': _bizlogic_csrf,
+    'bizlogic_workflow': _bizlogic_workflow,
+}
+
+
 def _execute_substage(sid, sub_id):
     sess = sessions.get(sid)
     sub = find_sub(sub_id)
@@ -2756,6 +4277,30 @@ def _execute_substage(sid, sub_id):
         return
     if sub_id == 'vuln_evidence':
         _run_evidence_capture(sid, sub_id, sub)
+        return
+
+    # Auth-tier gate: substages that need a logged-in account are skipped
+    # honestly (one informational coverage finding) when none was supplied —
+    # never fabricated, never reported as a vulnerability.
+    if sub.get('requires_creds') and not _has_creds_for(sess, sub.get('cred_roles')):
+        roles = ", ".join(sub.get('cred_roles') or ['any authenticated role'])
+        push(sid, "output", {"substage": sub_id,
+             "line": f"[auth-tier: credentials required ({roles}) — not tested]", "type": "meta"})
+        fnd = [{"type": "not_tested", "severity": "info", "path": "-",
+                "detail": f"Not tested — requires authenticated account(s): {roles}. "
+                          f"Supply accounts[] (role + username/password and/or token/cookie) "
+                          f"to the session to run this check.",
+                "command": ""}]
+        _normalize_findings(fnd, sess, sub_id)
+        sess.setdefault('findings', {})[sub_id] = fnd
+        sess['completed'].append(sub_id)
+        push(sid, "completed", {"substage": sub_id, "findings": fnd,
+             "finding_count": len(fnd), "rc": 0})
+        _advance_chain(sid, sub_id)
+        return
+
+    if sub_id in INPROC_SUBSTAGES:
+        INPROC_SUBSTAGES[sub_id](sid, sub_id, sub)
         return
 
     if PWM_CMD_TIMEOUT > 0:
@@ -2884,9 +4429,30 @@ def _launch_substage(sid, sub_id):
     threading.Thread(target=execute_substage, args=(sid, sub_id), daemon=True).start()
     return True
 
+_ASSETS_DIR = os.path.realpath(os.path.join(BASE_DIR, 'assets'))
+PWM_LOGO = os.path.join(_ASSETS_DIR, 'pwm.png')
+
+
 @app.route('/')
 def index():
     return send_file(os.path.join(BASE_DIR, 'frontend.html'))
+
+
+@app.route('/assets/<path:fname>')
+def asset(fname):
+    """Serve bundled assets (logo/screenshots). Path-traversal safe."""
+    path = os.path.realpath(os.path.join(_ASSETS_DIR, fname))
+    if not path.startswith(_ASSETS_DIR + os.sep) or not os.path.isfile(path):
+        return jsonify({"error": "not found"}), 404
+    return send_file(path)
+
+
+@app.route('/favicon.ico')
+def favicon():
+    """PWM logo as favicon (served as PNG — browsers honour <link rel=icon>)."""
+    if not os.path.isfile(PWM_LOGO):
+        return Response(status=204)
+    return send_file(PWM_LOGO, mimetype='image/png')
 
 @app.route('/api/chain')
 def get_chain():
@@ -2916,6 +4482,8 @@ def new_session():
         "ports_found": "", "banner_search": target,
         "network": infer_network(target), "notes": {},
         "triage_log": {}, "assessment": None,
+        "accounts": _norm_accounts(data.get('accounts')),
+        "web_origin": _origin_from_raw(raw),
     }
     output_queues[sid] = queue.Queue(maxsize=20000)
     return jsonify({"sid": sid, "target": target, "target_type": sessions[sid]['target_type']})
@@ -3064,6 +4632,7 @@ def status(sid):
         "ports_found": sess.get('ports_found',''),
         "triage_log": sess.get('triage_log', {}),
         "assessment": sess.get('assessment'),
+        "roles": [a.get('role') for a in sess.get('accounts', [])],
     })
 
 @app.route('/api/session/<sid>/report')
@@ -3467,6 +5036,11 @@ def build_pdf(sess: dict) -> str:
                     ["How Exploited", exploit],
                     ["Remediation",  rem_text],
                 ]
+                std_bits = [x for x in (f.get('owasp'), f.get('cwe'), f.get('attack')) if x]
+                if std_bits:
+                    detail_rows.insert(5, ["Standards", " · ".join(std_bits)])
+                if f.get('role'):
+                    detail_rows.insert(1, ["Tested Role", f['role']])
                 evidence = f.get('evidence', {}) or {}
                 ev_paths = []
                 if isinstance(evidence, dict):
@@ -3607,9 +5181,70 @@ def build_pdf(sess: dict) -> str:
                             "computed vector or from NVD for CVE-sourced findings.", META)]
         story.append(PageBreak())
 
+    # ── STANDARDS MAPPING ─────────────────────────────────────────────────
+    mapped = sorted({f.get('type') for f in all_f if f.get('type') in STANDARDS})
+    if mapped:
+        story += [
+            Paragraph("7. Standards Mapping (OWASP 2021 · CWE · MITRE ATT&CK)", H2),
+            HRFlowable(width="100%", thickness=0.5, color=colors.HexColor('#e1e4e8')),
+            Spacer(1,0.15*cm),
+        ]
+        s_rows = [["Finding Type", "OWASP Top 10 (2021)", "CWE", "ATT&CK"]]
+        for t in mapped:
+            ow, cw = STANDARDS[t]
+            s_rows.append([t.replace('_',' ')[:26], ow[:34], cw, ATTACK_BY_TYPE.get(t, '—')])
+        st2 = Table(s_rows, colWidths=[4.4*cm,6.2*cm,2.2*cm,2.7*cm])
+        st2.setStyle(TableStyle([
+            ('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),
+            ('FONTSIZE',(0,0),(-1,-1),8),
+            ('BACKGROUND',(0,0),(-1,0),colors.HexColor('#2d3748')),
+            ('TEXTCOLOR',(0,0),(-1,0),colors.white),
+            ('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.white,colors.HexColor('#f6f8fa')]),
+            ('GRID',(0,0),(-1,-1),0.3,colors.HexColor('#e1e4e8')),
+            ('TOPPADDING',(0,0),(-1,-1),3),('BOTTOMPADDING',(0,0),(-1,-1),3),
+            ('VALIGN',(0,0),(-1,-1),'TOP'),
+        ]))
+        story += [st2, Spacer(1,0.2*cm),
+                  Paragraph("Informational/discovery findings are intentionally left unclassified; "
+                            "signature-dependent findings are marked indeterminate pending per-evidence "
+                            "verification. No vulnerability category is asserted without evidence.", META),
+                  PageBreak()]
+
+    # ── ACCOUNT-TAKEOVER CHAIN ────────────────────────────────────────────
+    ato_f = [f for f in all_f if f.get('ato')]
+    if ato_f:
+        story += [
+            Paragraph("8. Account-Takeover Chain — Attacker Actions → Detections", H2),
+            HRFlowable(width="100%", thickness=0.5, color=colors.HexColor('#e1e4e8')),
+            Spacer(1,0.15*cm),
+            Paragraph("Findings that individually or chained can lead to account takeover, with "
+                      "concrete detection guidance for defenders.", META),
+            Spacer(1,0.15*cm),
+        ]
+        a_rows = [["Finding", "Attacker Action", "Detection"]]
+        seen = set()
+        for f in ato_f:
+            t = f.get('type')
+            if t in seen:
+                continue
+            seen.add(t)
+            a_rows.append([t.replace('_',' ')[:22], f['ato']['action'], f['ato']['detection']])
+        at = Table(a_rows, colWidths=[3.2*cm,6.3*cm,6*cm])
+        at.setStyle(TableStyle([
+            ('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),
+            ('FONTSIZE',(0,0),(-1,-1),8),
+            ('BACKGROUND',(0,0),(-1,0),colors.HexColor('#7d1d1d')),
+            ('TEXTCOLOR',(0,0),(-1,0),colors.white),
+            ('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.white,colors.HexColor('#fff5f5')]),
+            ('GRID',(0,0),(-1,-1),0.3,colors.HexColor('#e1e4e8')),
+            ('TOPPADDING',(0,0),(-1,-1),3),('BOTTOMPADDING',(0,0),(-1,-1),3),
+            ('VALIGN',(0,0),(-1,-1),'TOP'),
+        ]))
+        story += [at, Spacer(1,0.2*cm), PageBreak()]
+
     # ── RAW TOOL OUTPUT ───────────────────────────────────────────────────
     story += [
-        Paragraph("7. Raw Tool Output", H2),
+        Paragraph("9. Raw Tool Output", H2),
         HRFlowable(width="100%", thickness=0.5, color=colors.HexColor('#e1e4e8')),
     ]
     for stage in CHAIN:

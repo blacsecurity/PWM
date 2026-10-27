@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>PWM — Pentest Workflow Manager</title>
+<link rel="icon" type="image/png" href="/assets/pwm.png">
 <style>
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap');
 
@@ -102,15 +103,11 @@ body {
   flex-shrink: 0;
 }
 .brand-mark {
-  width: 28px; height: 28px;
-  background: linear-gradient(135deg, var(--acc2), var(--acc));
+  width: 30px; height: 30px;
   border-radius: 6px;
-  display: flex; align-items: center; justify-content: center;
-  font-family: var(--mono);
-  font-size: 11px;
-  font-weight: 600;
-  color: #fff;
-  letter-spacing: -0.5px;
+  display: block;
+  object-fit: contain;
+  flex-shrink: 0;
 }
 .brand-name {
   font-family: var(--mono);
@@ -1175,7 +1172,7 @@ body {
   <!-- TOP BAR -->
   <header class="topbar">
     <div class="brand">
-      <div class="brand-mark">PM</div>
+      <img class="brand-mark" src="/assets/pwm.png" alt="PWM" draggable="false">
       <div>
         <div class="brand-name">Pentest Workflow Manager</div>
       </div>
@@ -1336,7 +1333,7 @@ async function boot() {
 }
 
 // ── Nav ───────────────────────────────────────────────────────────────────────
-const STAGE_NUMS = {'recon':'01','vuln':'02','deep':'03','api_scan':'04','db_scan':'05','exploit_prep':'06','postex':'07'};
+const STAGE_NUMS = {'recon':'01','vuln':'02','deep':'03','api_scan':'04','db_scan':'05','reg_scan':'06','auth_scan':'07','session_scan':'08','authz_scan':'09','bizlogic_scan':'10','exploit_prep':'11','postex':'12'};
 function buildNav() {
   const tree = document.getElementById('chain-tree');
   tree.innerHTML = '';
@@ -2115,6 +2112,14 @@ function renderModalRows(findings) {
       : triage.verdict === 'needs_review' ? 't-review' : 't-info');
     const prov = triage.provenance === 'analyst' ? ' (override)' : '';
     const triageVal = esc((triage.verdict || 'needs_review').replace(/-/g,' ')) + prov;
+    const stdChips = []
+      .concat(f.owasp ? `<span class="triage-chip t-review" title="OWASP Top 10 (2021)">${esc(f.owasp)}</span>` : [])
+      .concat(f.cwe ? `<span class="triage-chip t-tool" title="Common Weakness Enumeration">${esc(f.cwe)}</span>` : [])
+      .concat(f.attack ? `<span class="triage-chip t-info" title="MITRE ATT&CK technique">${esc(f.attack)}</span>` : [])
+      .join(' ');
+    const stdRow = stdChips
+      ? `<div class="mr2-row"><span class="mr2-lbl">Standards</span><span class="mr2-val">${stdChips}${f.role ? ` <span class="triage-chip t-info">role: ${esc(f.role)}</span>` : ''}</span></div>`
+      : (f.role ? `<div class="mr2-row"><span class="mr2-lbl">Standards</span><span class="mr2-val"><span class="triage-chip t-info">role: ${esc(f.role)}</span></span></div>` : '');
 
     const ev = f.evidence && typeof f.evidence === 'object' ? f.evidence : {};
     const evFiles = [...(ev.screenshots || []), ...(ev.pcap ? [ev.pcap] : [])]
@@ -2167,6 +2172,7 @@ function renderModalRows(findings) {
             <option value="needs_review">needs_review</option>
             <option value="info">info (dismiss)</option>
           </select>` : ''}</span></div>
+        ${stdRow}
         ${evLine}
         <div class="mr2-row"><span class="mr2-lbl">Path</span><span class="mr2-val" style="font-family:var(--mono);font-size:10px;color:var(--acc)">${esc(path)}</span></div>
         <div class="mr2-row"><span class="mr2-lbl">Command</span><span class="mr2-val" style="font-family:var(--mono);font-size:9.5px;color:var(--grn)">${esc(cmd)}</span></div>
