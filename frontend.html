@@ -1507,6 +1507,7 @@ async function startSession(e) {
       if (ce && sub.cmd_template) {
         ce.textContent = sub.cmd_template
           .replace(/\{target\}/g, d.target)
+          .replace(/\{base_url\}/g, `http://${d.target}`)
           .replace(/\{outdir\}/g, `/tmp/pwm_${SID.slice(0,8)}`)
           .replace(/\{ports\}/g, '21,22,23,25,80,443,445,3306,3389,8080')
           .replace(/\{banner_search\}/g, d.target)
@@ -1520,11 +1521,13 @@ async function startSession(e) {
       if (sa) sa.classList.add('show');
     });
 
-    // mark first sequential stage's first substage as awaiting
-    const firstSeq = CHAIN.find(s => !s.parallel);
-    if (firstSeq) {
-      setSS(firstSeq.substages[0].id, 'awaiting');
-      showPane(firstSeq.substages[0].id);
+    // mark the chain's first substage as awaiting. Stage 1 can itself be a
+    // parallel stage (recon), so never skip it while looking for a serial
+    // stage — that used to open the UI on a later stage's sub-pane.
+    const firstStage = CHAIN[0];
+    if (firstStage && firstStage.substages.length) {
+      setSS(firstStage.substages[0].id, 'awaiting');
+      showPane(firstStage.substages[0].id);
     }
 
     connectSSE();

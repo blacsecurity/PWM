@@ -5,9 +5,9 @@ verified findings, fixed PDF report with PoC + code-fix examples,
 enriched popup data (path, command, remediation).
 """
 
-import os, re, uuid, json, time, queue, threading, subprocess, shutil, html, socket, signal, ipaddress, select, urllib.request, urllib.parse, math as _math, inspect, shlex
+import os, re, uuid, json, time, queue, threading, subprocess, shutil, html, socket, signal, ipaddress, select, urllib.request, urllib.parse, math as _math, inspect, shlex, hmac, tempfile
 from datetime import datetime
-from flask import Flask, request, Response, jsonify, send_file
+from flask import Flask, request, Response, jsonify, send_file, redirect
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import cm
@@ -66,9 +66,55 @@ NUCLEI_TPL = _nuclei_templates_dir()
 
 @app.before_request
 def _api_token_gate():
+    """Protect /api/* when PWM_API_TOKEN is configured.
+
+    Accepted credentials (any one):
+      - X-API-Token header (scripts / curl)
+      - pwm_api_token cookie (set by /auth; browsers + EventSource send it
+        automatically, so the bundled UI works without custom SSE headers)
+      - ?token= query parameter (handy for one-off requests)
+    """
     if PWM_API_TOKEN and request.path.startswith('/api/'):
-        if request.headers.get('X-API-Token') != PWM_API_TOKEN:
+        if not _token_ok():
             return jsonify(error='Unauthorized'), 401
+
+
+def _token_ok():
+    supplied = (request.headers.get('X-API-Token')
+                or request.cookies.get('pwm_api_token')
+                or request.args.get('token')
+                or '')
+    return bool(supplied) and hmac.compare_digest(supplied, PWM_API_TOKEN)
+
+
+def _login_page(error=''):
+    msg = f'<p class="err">{html.escape(error)}</p>' if error else ''
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PWM — API token required</title>
+<style>
+ body{{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+       background:#0d1117;color:#e6edf3;display:flex;min-height:100vh;
+       align-items:center;justify-content:center}}
+ .card{{background:#161b22;border:1px solid #30363d;border-radius:10px;
+        padding:2rem;width:min(92vw,380px)}}
+ h1{{font-size:1.1rem;margin:0 0 .4rem}} p{{color:#8b949e;font-size:.85rem}}
+ .err{{color:#f85149;font-size:.85rem}}
+ input{{width:100%;box-sizing:border-box;padding:.6rem;margin:.6rem 0;
+        background:#0d1117;border:1px solid #30363d;border-radius:6px;
+        color:#e6edf3;font-size:.95rem}}
+ button{{width:100%;padding:.6rem;border:0;border-radius:6px;
+         background:#238636;color:#fff;font-weight:600;cursor:pointer}}
+</style></head><body><form class="card" method="post" action="/auth">
+<h1>API token required</h1>
+<p>This PWM instance is protected by PWM_API_TOKEN.
+Enter it once — a HttpOnly cookie will keep the dashboard authenticated.</p>
+{msg}
+<input name="token" type="password" autofocus autocomplete="current-password"
+       placeholder="PWM_API_TOKEN" required>
+<button type="submit">Unlock dashboard</button>
+</form></body></html>"""
 
 sessions: dict = {}
 output_queues: dict = {}
@@ -79,7 +125,7 @@ output_queues: dict = {}
 CHAIN = [
     {
         "id": "recon", "label": "Stage 1 — Reconnaissance",
-        "color": "blue", "icon": "01", "parallel": False,
+        "color": "blue", "icon": "01", "parallel": True,
         "substages": [
             {
                 "id": "recon_ports", "label": "Port & Service Scan", "tool": "nmap / masscan",
@@ -173,10 +219,10 @@ CHAIN = [
                 "parse": "version_cve",
             },
             {
-                "id": "recon_tech", "label": "Web Stack / Technology Fingerprint", "tool": "whatweb / nuclei",
-                "description": "Fingerprint the web stack — server, CMS, framework, libraries — via whatweb level-3 and the nuclei technologies template set. Emits informational technology findings only.",
-                "cmd_template": "echo '=WHATWEB='; if command -v whatweb >/dev/null 2>&1; then timeout -k 5 60 whatweb -a 3 http://{target} 2>&1 | head -30; else echo '[whatweb not installed]'; fi; echo '=NUCLEI TECHNOLOGIES='; if command -v nuclei >/dev/null 2>&1 && [ -d {nuclei_dir}/http/technologies ]; then timeout -k 5 120 nuclei -u http://{target} -t {nuclei_dir}/http/technologies -silent -duc 2>&1 | head -60; else echo '[nuclei or templates not installed]'; fi",
-                "fallback_cmd": "curl -skIL --max-time 8 http://{target} 2>&1 | head -30",
+                "id": "recon_tech", "label": "Web Stack / Technology Fingerprint", "tool": "whatweb / curl / nuclei",
+                "description": "Fingerprint the web stack from four real evidence sources — whatweb plugins, response headers, HTML asset/meta tags and the nuclei technologies template set. Every observed technology is classified into Analytics, CDN, Security, UI/Web Frameworks, Advertising, Payment Processors, Font Scripts, Libraries, RUM, Web Servers, Customer Data Platform, Programming Languages or Miscellaneous. Informational only; a technology is never reported unless its signature is literally present in the output.",
+                "cmd_template": "echo '=WHATWEB='; if command -v whatweb >/dev/null 2>&1; then timeout -k 5 60 whatweb -a 3 {base_url} 2>&1 | head -20; else echo '[whatweb not installed]'; fi; echo '=HEADERS='; timeout -k 5 20 curl -skIL --max-time 8 {base_url} 2>&1 | head -40; echo '=BODY='; timeout -k 5 25 curl -sk --max-time 10 {base_url} 2>&1 | grep -oiE '<(script|link|meta|img)[^>]*>|(__NEXT_DATA__|__NUXT__|data-reactroot|wp-content|wp-includes)' | head -60; echo '=NUCLEI TECHNOLOGIES='; if command -v nuclei >/dev/null 2>&1 && [ -d {nuclei_dir}/http/technologies ]; then timeout -k 5 150 nuclei -u {base_url} -t {nuclei_dir}/http/technologies -silent -duc 2>&1 | head -60; else echo '[nuclei or templates not installed]'; fi",
+                "fallback_cmd": "curl -skIL --max-time 8 {base_url} 2>&1 | head -30",
                 "parse": "tech",
             },
             {
@@ -188,8 +234,8 @@ CHAIN = [
             },
             {
                 "id": "recon_content", "label": "Content Discovery", "tool": "ffuf / gobuster",
-                "description": "Directory/file discovery with ffuf and gobuster wordlists. Findings are informational paths — never vulnerabilities by status alone. 3xx statuses are explicitly ignored for vuln claims.",
-                "cmd_template": "echo '=GOBUSTER='; if command -v gobuster >/dev/null 2>&1; then gobuster dir -u http://{target} -w /usr/share/wordlists/dirb/common.txt -t 40 -q --no-error -x php,txt,bak,bak2,sql,zip,tar.gz,conf,xml,json,log,env -o {outdir}/gobuster_recon.txt 2>&1 | head -80; else echo '[gobuster not installed]'; fi; echo '=FFUF='; if command -v ffuf >/dev/null 2>&1; then ffuf -u 'http://{target}/FUZZ' -w /usr/share/wordlists/dirb/common.txt -mc 200,201,202,204,301,302,307,308,401,403 -fc 404 -t 40 2>&1 | grep -viE 'INFO|WARNING' | head -60; else echo '[ffuf not installed]'; fi",
+                "description": "Directory/file discovery with ffuf and gobuster wordlists against the discovered web origin ({base_url}). Both tools are wall-clock bounded (240s gobuster / 120s ffuf) with 5s per-request timeouts so a stalled or filtered host can never hang the substage. Findings are informational paths — never vulnerabilities by status alone. 3xx statuses are explicitly ignored for vuln claims.",
+                "cmd_template": "echo '=GOBUSTER='; if command -v gobuster >/dev/null 2>&1; then timeout -k 5 240 gobuster dir -u {base_url} -w /usr/share/wordlists/dirb/common.txt -t 40 -q --no-error --timeout 5s -x php,txt,bak,bak2,sql,zip,tar.gz,conf,xml,json,log,env -o {outdir}/gobuster_recon.txt 2>&1 | head -80; else echo '[gobuster not installed]'; fi; echo '=FFUF='; if command -v ffuf >/dev/null 2>&1; then timeout -k 5 120 ffuf -u {base_url}/FUZZ -w /usr/share/wordlists/dirb/common.txt -mc 200,201,202,204,301,302,307,308,401,403 -fc 404 -t 40 -timeout 5 2>&1 | grep -viE 'INFO|WARNING' | head -60; else echo '[ffuf not installed]'; fi",
                 "fallback_cmd": "echo '[content discovery tools not available]'",
                 "parse": "dirb",
             },
@@ -993,7 +1039,6 @@ CPE_TABLE = {
     "bind":         ("isc", "bind"),
     "jenkins":      ("jenkins", "jenkins"),
     "iis":          ("microsoft", "internet_information_services"),
-    "vsftpd":       ("vsftpd", "vsftpd"),
     "grafana":      ("grafana", "grafana"),
     "wordpress":    ("wordpress", "wordpress"),
     "drupal":       ("drupal", "drupal"),
@@ -1111,7 +1156,9 @@ def _capture_evidence(f, sess):
             rec["errors"].append(f"{binname} screenshot produced no valid PNG")
     if not chrome_found:
         rec["errors"].append("no headless chrome binary found — screenshot skipped")
-    if shot and os.path.exists(shot):
+    if shot and shot not in rec["screenshots"] and os.path.exists(shot):
+        # only remove a capture that failed validation; a valid screenshot is
+        # the evidence artifact and must survive (it used to be deleted here).
         try: os.remove(shot)
         except OSError: pass
 
@@ -1152,32 +1199,57 @@ def _capture_evidence(f, sess):
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 def detect_target_type(t):
-    t = t.strip()
-    if re.match(r'^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$', t): return 'network'
-    if re.match(r'^\d{1,3}(\.\d{1,3}){3}$', t): return 'ip'
-    if re.match(r'^https?://', t): return 'url'
-    return 'domain'
+    """Classify the operator input. IPv6 literals and CIDR ranges are
+    recognised explicitly (they used to fall through to 'domain')."""
+    t = (t or '').strip()
+    if re.match(r'^https?://', t, re.I):
+        return 'url'
+    host = clean_target(t)
+    if '/' in host:
+        try:
+            ipaddress.ip_network(host, strict=False)
+            return 'network'
+        except ValueError:
+            return 'domain'
+    try:
+        ipaddress.ip_address(host)
+        return 'ip'
+    except ValueError:
+        return 'domain'
+
 
 def clean_target(raw):
-    t = re.sub(r'^https?://', '', raw.strip()).rstrip('/')
+    """Reduce operator input to a host (or host/CIDR) for command templates.
+
+    CIDR prefixes and IPv6 literals are preserved; only URL scheme, path and
+    host:port are stripped.  Dropping the prefix here was silently turning a
+    /24 request into a single-host scan."""
+    t = re.sub(r'^https?://', '', (raw or '').strip(), flags=re.I).rstrip('/')
     if not t:
         return ''
+    if t.startswith('['):                          # [::1] or [::1]:8080[/cidr]
+        inner = t[1:].split(']', 1)[0]
+        rest = t.split(']', 1)[1] if ']' in t else ''
+        m = re.match(r'^/(\d{1,3})$', rest)
+        return f"{inner}/{m.group(1)}" if m else inner
     if ':' in t:
-        if t.startswith('['):                      # [::1] or [::1]:8080
-            return t[1:].split(']')[0]
         host = t.split('/')[0]
         if host.count(':') >= 2:                   # bare IPv6 literal (with optional /CIDR)
             try:
-                return str(ipaddress.ip_interface(t).ip)
+                if '/' in t:
+                    return str(ipaddress.ip_interface(t))
+                return str(ipaddress.ip_address(host))
             except ValueError:
                 return host
-        try:                                       # hostname:port / ip:port
-            if re.fullmatch(r'[^:]+:\d{1,5}', host):
-                return host.rsplit(':', 1)[0]
-        except Exception:
-            pass
+        if re.fullmatch(r'[^:]+:\d{1,5}', host):   # hostname:port / ip:port
+            return host.rsplit(':', 1)[0]
         return host
+    # IPv4 with optional CIDR: keep the prefix (nmap scans the range)
+    m = re.fullmatch(r'(\d{1,3}(?:\.\d{1,3}){3})(?:/(\d{1,2}))?', t)
+    if m:
+        return f"{m.group(1)}/{m.group(2)}" if m.group(2) is not None else m.group(1)
     return t.split('/')[0]
+
 
 def _origin_from_raw(raw):
     """Preserve an operator-supplied scheme://host:port for the auth-tier
@@ -1189,25 +1261,35 @@ def _origin_from_raw(raw):
 
 def is_valid_target(t):
     """Allow only hostnames, IPv4 (optionally with CIDR) and IPv6 literals.
-    Rejects anything containing shell metacharacters (command injection guard)."""
+    Rejects anything containing shell metacharacters (command injection guard).
+    IP/CIDR values are validated by the stdlib parser, not by a loose regex."""
     if not t or len(t) > 253:
         return False
-    if re.match(r'^\d{1,3}(\.\d{1,3}){3}(/\d{1,2})?$', t):
-        octets = t.split('/')[0].split('.')
-        cidr = t.split('/')[1] if '/' in t else None
-        if cidr is not None and not (0 <= int(cidr) <= 32):
+    if re.fullmatch(r'[0-9A-Fa-f:.]+/\d{1,3}', t):
+        try:
+            ipaddress.ip_network(t, strict=False)
+            return True
+        except ValueError:
             return False
-        return all(0 <= int(o) <= 255 for o in octets)
-    if re.match(r'^[0-9a-fA-F:]+$', t) and ':' in t:  # IPv6 literal
-        return True
+    if re.fullmatch(r'\d{1,3}(?:\.\d{1,3}){3}', t) or (':' in t and re.fullmatch(r'[0-9A-Fa-f:.]+', t)):
+        try:
+            ipaddress.ip_address(t)
+            return True
+        except ValueError:
+            return False
     # hostname / FQDN
     return bool(re.match(r'^[A-Za-z0-9]([A-Za-z0-9\-_.]*[A-Za-z0-9])?$', t)) and '..' not in t
 
+
 def infer_network(target):
     """Derive a scan scope without inventing ranges.
-    A single IP or hostname scans only that host; only explicit CIDR input is kept as a range."""
+    A single IP or hostname scans only that host; an explicit CIDR is
+    normalised to its network address and kept as a range."""
     if '/' in target:
-        return target
+        try:
+            return str(ipaddress.ip_network(target, strict=False))
+        except ValueError:
+            return target
     return target
 
 def make_cmd(template, sess):
@@ -1234,16 +1316,30 @@ def make_cmd(template, sess):
         return str(vals.get(key, m.group(0)))
     return re.sub(r'\{\{|\}\}|\{(\w+)\}', repl, template)
 
+_QUEUE_LOCK = threading.Lock()
+
 def push(sid, event, data):
+    """Enqueue an SSE event without ever blocking a producer.
+
+    The previous check-then-block (full() → get_nowait() → put()) was racy:
+    two parallel substage threads could both pass the check and then block
+    forever.  All queue mutation now happens under one lock using only
+    non-blocking calls."""
     q = output_queues.get(sid)
     if not q:
         return
-    if q.full():
+    item = {"event": event, "data": json.dumps(data)}
+    with _QUEUE_LOCK:
+        if q.full():
+            try:
+                q.get_nowait()          # drop the oldest event (drop-oldest policy)
+            except queue.Empty:
+                pass
         try:
-            q.get_nowait()
-        except queue.Empty:
+            q.put_nowait(item)
+        except queue.Full:
+            # A concurrent consumer/producer changed capacity; never spin or block.
             pass
-    q.put({"event": event, "data": json.dumps(data)})
 
 def find_sub(sub_id):
     for stage in CHAIN:
@@ -1541,9 +1637,26 @@ def parse_snmp(output):
                           "command":"snmpwalk -v2c -c public <target>"})
     return findings
 
-def parse_dirb(output):
+def parse_dirb(output, sess=None):
     findings = []
     ansi_re = re.compile(r'\x1b\[[0-9;]*[mGKHF]')
+    # absolute origin the tools actually scanned ({base_url} in make_cmd), so
+    # reported URLs/commands are reproducible — never a bare port-80 guess
+    origin = _base_url(sess) if isinstance(sess, dict) else None
+    emitted = set()
+
+    def emit(code, url, path):
+        key = (path, code)
+        if key in emitted:
+            return
+        emitted.add(key)
+        # Status-only content discovery is recon, never a vuln claim: a
+        # catch-all router returns 200 for anything. Body verification is
+        # the job of the dedicated .env/.git/etc probes.
+        findings.append({"type": "web_path", "detail": f"HTTP {code} {url}",
+                         "severity": "info", "path": path,
+                         "command": f"curl -skL {url}"})
+
     for line in output.splitlines():
         m = re.search(r'(https?://\S+)\s+\(CODE:(\d+)', line)
         if m:
@@ -1551,12 +1664,7 @@ def parse_dirb(output):
             if code in REDIRECT_CODES or code not in ('200', '201', '204', '401', '403'):
                 continue
             path = re.sub(r'https?://[^/]+', '', url)
-            # Status-only content discovery is recon, never a vuln claim: a
-            # catch-all router returns 200 for anything. Body verification is
-            # the job of the dedicated .env/.git/etc probes.
-            findings.append({"type": "web_path", "detail": f"HTTP {code} {url}",
-                             "severity": "info", "path": path,
-                             "command": f"curl -skL {url}"})
+            emit(code, url, path)
             continue
         # gobuster: index.html (Status: 200) [Size: 1234]
         g = re.search(r'(/?\S+)\s+\(Status:\s*(\d+)\)', line)
@@ -1566,9 +1674,8 @@ def parse_dirb(output):
                 path = '/' + path
             if code in REDIRECT_CODES or code not in ('200', '201', '204', '401', '403'):
                 continue
-            findings.append({"type": "web_path", "detail": f"HTTP {code} http://<target>{path} (gobuster)",
-                             "severity": "info", "path": path,
-                             "command": f"curl -skL http://<target>{path}"})
+            base = origin or 'http://<target>'
+            emit(code, f"{base}{path}", path)
             continue
         # ffuf (2.x writes path-only lines, ANSI-prefixed, with progress glued on \r):
         #   '\x1b[2K.bash_history   [Status: 200, Size: 41, Words: 3, ...]'
@@ -1583,11 +1690,11 @@ def parse_dirb(output):
                 continue
             if url.startswith('http'):
                 path = re.sub(r'https?://[^/]+', '', url)
+                emit(code, url, path)
             else:
                 path = url if url.startswith('/') else '/' + url
-            findings.append({"type": "web_path", "detail": f"HTTP {code} http://<target>{path} (ffuf)",
-                             "severity": "info", "path": path,
-                             "command": f"curl -skL http://<target>{path}"})
+                base = origin or 'http://<target>'
+                emit(code, f"{base}{path}", path)
     return findings
 
 def parse_banner_anomaly(output):
@@ -1846,7 +1953,12 @@ def _api_evidence(path, code, body):
             'jvm_', 'process_', 'http_server_', 'prometheus', '_samples'))
     if path == '/health':
         return bool(body) and '"status"' in body
-    return True
+    # Default deny: a bare status code on an arbitrary path is what a catch-all
+    # router returns for everything, so it proves nothing. Any other path only
+    # becomes a finding when the body is an actual JSON/API document.
+    if code in ('401', '403', '405'):
+        return False
+    return bool(body) and len(body.strip()) > 2 and body.lstrip()[:1] in ('{', '[')
 
 
 def parse_api_discovery(output):
@@ -2047,20 +2159,36 @@ def parse_api_misc(output):
             "detail":"API CORS wildcard — any origin can read API responses",
             "path":"/api/v1 (CORS headers)",
             "command":"curl -H 'Origin: https://evil.com' -I http://<target>/api/v1/users"})
-    responses = [r for r in re.findall(r'\b(\d{3})\b', output[:500]) if r != '000' and r not in REDIRECT_CODES]
-    total = len(responses)
-    non_429 = [r for r in responses if r != '429']
-    if total >= 10 and len(non_429) == total:
+    # Rate-limit evidence: only the burst line counts. Scanning the first 500
+    # characters for any 3-digit run picked up ids, versions and byte counts and
+    # reported "no rate limiting" from unrelated numbers.
+    rl_codes = []
+    for line in output.splitlines():
+        codes = re.findall(r'(?<![\w.])(\d{3})(?![\w.])', line)
+        codes = [c for c in codes if c[0] in '12345']
+        if len(codes) >= 10:            # the burst itself (>=10 responses)
+            rl_codes.extend(codes)
+    total = len(rl_codes)
+    if total >= 10 and '429' not in rl_codes:
         findings.append({"type":"missing_rate_limit","severity":"medium",
             "detail":f"No rate limiting detected — {total} requests returned without any 429/throttle",
             "path":"/api/v1/login (rate limit test)",
             "command":"for i in $(seq 1 50); do curl -s -o /dev/null -w '%{http_code}' http://<target>/api/v1/login; done"})
-    if re.search(r'api_key|secret_key|aws_secret|stripe_key|twilio|sendgrid', output, re.I):
+    # A key/secret *field name* is not an exposed credential; require an actual
+    # assignment with a value long enough to be a real secret.
+    key_m = re.search(
+        r'["\']?(?:api[_-]?key|secret[_-]?key|aws[_-]?secret[_-]?(?:access[_-]?key)?|'
+        r'stripe[_-]?(?:secret[_-]?)?key|twilio[_-]?(?:auth[_-]?)?token|sendgrid[_-]?(?:api[_-]?)?key)'
+        r'["\']?\s*[:=]\s*["\']([^"\'\s]{12,})["\']', output, re.I)
+    if not key_m:
+        key_m = re.search(r'\b(AKIA[0-9A-Z]{16})\b', output)
+    if key_m:
         findings.append({"type":"api_key_exposure","severity":"critical",
             "detail":"API key or secret token visible in /api/v1/config response",
             "path":"/api/v1/config",
             "command":"curl -sk http://<target>/api/v1/config | grep -iE 'key|secret|token'"})
-    if re.search(r'(stack trace|traceback|exception|syntax error|ORA-|SQLSTATE)', output, re.I):
+    if re.search(r'(Traceback \(most recent call last\)|stack trace:|SQLSTATE\[|ORA-\d{5}|'
+                 r'at [\w.$]+\([\w.$]+:\d+\)|on line \d+</b>|php on line \d+)', output, re.I):
         findings.append({"type":"verbose_error","severity":"medium",
             "detail":"Verbose error messages in API response — internal stack trace disclosed",
             "path":"/api/v1 (error endpoint)",
@@ -2182,17 +2310,27 @@ def parse_db_sqli(output):
 
 def parse_db_nosql(output):
     findings = []
-    if re.search(r'"(logged_in|success|token|user|data)".*:.*true|\{.*"_id"', output, re.I):
+    # Response-artifact evidence only. A healthy endpoint returning
+    # {"success":true} is not NoSQL injection; a bypass must have produced a
+    # session/credential artifact (the request echo is stripped before parsing).
+    auth_art = re.search(
+        r'"(?:access_token|id_token|refresh_token|token|jwt|session(?:id|_token)?)"\s*:\s*"[^"]{10,}"',
+        output, re.I)
+    auth_flag = re.search(r'"(?:authenticated|logged_in)"\s*:\s*true', output, re.I)
+    if auth_art or auth_flag:
         findings.append({"type":"nosql_injection","severity":"critical",
             "detail":"NoSQL operator injection ($gt/$ne/$regex) bypassed authentication",
             "path":"/login or /api/login (POST body JSON)",
             "command":"curl -X POST -H 'Content-Type: application/json' -d '{\"username\":{\"$gt\":\"\"},\"password\":{\"$gt\":\"\"}}' http://<target>/login"})
-    if re.search(r'\$where.*1==1|where.*true', output, re.I):
+    # $where injection must have produced a server-side JS error, otherwise the
+    # text could simply be reflected input.
+    if re.search(r'\$where\b', output, re.I) and re.search(
+            r'(SyntaxError|TypeError|ReferenceError|not a function|is not defined)', output):
         findings.append({"type":"nosql_injection","severity":"critical",
             "detail":"NoSQL $where JS injection accepted — server-side JS execution possible",
             "path":"/api/v1/users (POST body)",
             "command":"curl -X POST -H 'Content-Type: application/json' -d '{\"$where\":\"1==1\"}' http://<target>/api/v1/users"})
-    if re.search(r'requirepass.*\(empty\)|requirepass\s+$', output, re.I):
+    if re.search(r'requirepass.*\(empty\)|1\)\s*"requirepass"\s*\n\s*2\)\s*""', output, re.I):
         findings.append({"type":"redis_no_auth","severity":"critical",
             "detail":"Redis requirepass is empty — no authentication configured",
             "path":"Redis :6379 (CONFIG GET requirepass)",
@@ -2211,12 +2349,18 @@ def parse_db_privesc(output):
             "detail":"MySQL FILE/SUPER/GRANT privilege granted — potential OS file read/write and privilege escalation",
             "path":"MySQL :3306 (SHOW GRANTS)",
             "command":"mysql -h <target> -u <user> -e 'SHOW GRANTS FOR CURRENT_USER()'"})
-    if re.search(r'log.*OFF|general_log.*OFF|slow_query_log.*OFF', output, re.I):
+    if re.search(r'general_log\s*[:=|]?\s*(?:OFF|0)|slow_query_log\s*[:=|]?\s*(?:OFF|0)', output, re.I):
         findings.append({"type":"db_no_audit_log","severity":"medium",
             "detail":"MySQL query logging disabled — no audit trail for malicious queries",
             "path":"MySQL :3306 (SHOW VARIABLES)",
             "command":"mysql -h <target> -u root -e \"SHOW VARIABLES LIKE '%log%'\""})
-    if re.search(r'ssl_type.*\s*$|have_ssl.*DISABLED|have_ssl.*NO', output, re.I):
+    # Only explicit "SSL/TLS is off" statements count. Matching any `ssl_type`
+    # token flagged every MySQL host (the column is empty when the *user* has no
+    # SSL requirement, which says nothing about server transport encryption).
+    if re.search(r'have_ssl\s*[:=|]?\s*(?:DISABLED|NO)\b|'
+                 r'have_ssl\s*[:=|]?\s*["\']?\s*(?:OFF|0|NONE)\b|'
+                 r'(?:ssl|tls)\s*(?:support|enabled)?\s*[:=]\s*(?:false|no|off|disabled)\b|'
+                 r'(?:server\s+)?does\s+not\s+support\s+(?:ssl|tls)', output, re.I):
         findings.append({"type":"db_unencrypted_conn","severity":"high",
             "detail":"Database connections not encrypted — traffic readable in transit",
             "path":"MySQL/PostgreSQL (SSL status)",
@@ -2226,7 +2370,10 @@ def parse_db_privesc(output):
             "detail":"Verbose DB error message in HTTP response — DBMS type/version disclosed",
             "path":"/?id=' (error response)",
             "command":"curl -sk 'http://<target>/?id=1\\'' | grep -iE 'sql|mysql|postgres|oracle'"})
-    if re.search(r'ssl.*disabled|encrypted.*false|cipher.*none', output, re.I):
+    # Explicit NSE "not supported" wording only; "SSLv2 disabled" from an SSL
+    # scan is a good result, not an unencrypted database.
+    if re.search(r'(?:mysql|pgsql|mssql)[^\n]{0,40}(?:ssl|tls)[^\n]{0,40}(?:disabled|not supported|not enabled)|'
+                 r'(?:ssl|tls)[^\n]{0,20}(?:is\s+)?not\s+enabled[^\n]{0,20}(?:mysql|postgres)', output, re.I):
         findings.append({"type":"db_unencrypted_conn","severity":"high",
             "detail":"Database connection unencrypted — data at rest and in transit unprotected",
             "path":"DB port (TLS check)",
@@ -2480,7 +2627,10 @@ def parse_js_leak(output, sess):
             srcs.append(s)
             continue
         if s.startswith('SECRET:'):
-            _, kind, value = s.split(':', 2)
+            parts = s.split(':', 2)
+            if len(parts) < 3 or not parts[1].strip() or not parts[2].strip():
+                continue        # malformed marker — never crash the whole scan
+            _, kind, value = parts
             key = (kind, value[:40])
             if key in seen_secrets: continue
             seen_secrets.add(key)
@@ -2569,38 +2719,341 @@ def parse_version_cve(output, sess):
             break
     return findings
 
+# ── Technology fingerprint classification ───────────────────────────────────
+# Categories reported by the Web Stack / Technology Fingerprint substage.
+# The rule table below only CLASSIFIES evidence that a tool actually printed;
+# it can never introduce a technology that was not observed.
+TECH_CATEGORY_LIST = [
+    "Analytics", "CDN", "Security", "UI/Web Frameworks", "Advertising",
+    "Payment Processors", "Font Scripts", "Libraries", "Miscellaneous",
+    "RUM", "Web Servers", "Customer Data Platform", "Programming Languages",
+]
+
+# whatweb plugins that describe geo/IP/status metadata, not a technology
+TECH_NON_TECH = {
+    "country", "ip", "ip-address", "ipv6", "status-line", "title",
+    "redirectlocation", "script", "scripts", "uncommonheaders",
+    "commonheaders", "cookies", "meta-author", "meta-description",
+    "meta-viewport", "image-size", "favicon", "uncommon-headers",
+}
+
+# (pattern on lowercased evidence, technology label, category) — first match wins
+_TECH_RULES = [
+    # CDN / edge (asset CDNs before the provider rules: cdnjs.cloudflare.com
+    # is a library CDN, while the cf-ray header below still names Cloudflare)
+    (r"cdnjs|jsdelivr|unpkg|bootstrapcdn|bootcdn|ajax\.googleapis|code\.jquery",
+     "JavaScript CDN", "CDN"),
+    (r"cf-ray|cf-cache-status|\bcloudflare\b", "Cloudflare", "CDN"),
+    (r"x-amz-cf|\bcloudfront\b", "Amazon CloudFront", "CDN"),
+    (r"\bfastly\b|x-fastly", "Fastly", "CDN"),
+    (r"\bakamai\b|x-akamai", "Akamai", "CDN"),
+    (r"\bbunnycdn\b|x-bunnycdn", "BunnyCDN", "CDN"),
+    (r"\bstackpath\b|x-stackpath", "StackPath", "CDN"),
+    (r"azureedge", "Microsoft Azure CDN", "CDN"),
+    # Security products / WAF
+    (r"\bsucuri\b|x-sucuri", "Sucuri", "Security"),
+    (r"\bimperva\b|\bincapsula\b|x-iinfo", "Imperva/Incapsula", "Security"),
+    (r"x-amzn-waf|amzn-waf|aws waf", "AWS WAF", "Security"),
+    (r"\bfortiweb\b|\bfortigate\b|\bfortinet\b", "Fortinet", "Security"),
+    (r"\bbigip\b|x-f5-", "F5 BIG-IP", "Security"),
+    (r"\bmodsecurity\b", "ModSecurity", "Security"),
+    (r"\bbarracuda\b", "Barracuda WAF", "Security"),
+    # RUM / observability agents
+    (r"newrelic|nr-data\.net|new relic", "New Relic", "RUM"),
+    (r"datadoghq|datadog", "Datadog", "RUM"),
+    (r"\bsentry\b|sentry-cdn", "Sentry", "RUM"),
+    (r"cloudflareinsights", "Cloudflare Insights", "RUM"),
+    (r"\bfullstory\b", "FullStory", "RUM"),
+    (r"\bspeedcurve\b", "SpeedCurve", "RUM"),
+    (r"\bpingdom\b|ptmstats", "Pingdom", "RUM"),
+    (r"\bdynatrace\b", "Dynatrace", "RUM"),
+    (r"appdynamics", "AppDynamics", "RUM"),
+    (r"clarity\.ms|microsoft clarity", "Microsoft Clarity", "RUM"),
+    (r"elastic-apm|elasticapm", "Elastic APM", "RUM"),
+    # Customer data platforms (before analytics: segment ships analytics.js)
+    (r"segment\.com|segment\.io|analytics\.load\.segment", "Segment", "Customer Data Platform"),
+    (r"\bmparticle\b", "mParticle", "Customer Data Platform"),
+    (r"\blytics\b", "Lytics", "Customer Data Platform"),
+    (r"\bblueconic\b", "BlueConic", "Customer Data Platform"),
+    (r"\btealium\b|utag\.", "Tealium", "Customer Data Platform"),
+    (r"treasuredata", "Treasure Data", "Customer Data Platform"),
+    # Analytics
+    (r"google-analytics|googletagmanager|google tag manager|ga\.js|\bgtag\b",
+     "Google Analytics / Tag Manager", "Analytics"),
+    (r"\bmatomo\b|\bpiwik\b", "Matomo", "Analytics"),
+    (r"\bmixpanel\b", "Mixpanel", "Analytics"),
+    (r"\bamplitude\b", "Amplitude", "Analytics"),
+    (r"kissmetrics", "Kissmetrics", "Analytics"),
+    (r"\bhotjar\b", "Hotjar", "Analytics"),
+    (r"crazyegg", "Crazy Egg", "Analytics"),
+    (r"heapanalytics|heap\.io", "Heap", "Analytics"),
+    (r"statcounter", "StatCounter", "Analytics"),
+    (r"chartbeat", "Chartbeat", "Analytics"),
+    (r"\bplausible\b", "Plausible", "Analytics"),
+    (r"fathom\.analytics|fathom\.cc", "Fathom", "Analytics"),
+    # Advertising
+    (r"adsense|googlesyndication|googleadservices|doubleclick", "Google Ads / AdSense", "Advertising"),
+    (r"connect\.facebook\.net|fbevents", "Meta Pixel", "Advertising"),
+    (r"\badnxs\b", "AppNexus", "Advertising"),
+    (r"\bcriteo\b", "Criteo", "Advertising"),
+    (r"\btaboola\b", "Taboola", "Advertising"),
+    (r"\boutbrain\b", "Outbrain", "Advertising"),
+    (r"amazon-adsystem", "Amazon Advertising", "Advertising"),
+    (r"bat\.bing\.com", "Microsoft Advertising", "Advertising"),
+    (r"adsrvr\.org|demdex", "The Trade Desk / Adobe Demdex", "Advertising"),
+    (r"doubleverify", "DoubleVerify", "Advertising"),
+    (r"\bmoatads\b", "Moat", "Advertising"),
+    # Payment processors
+    (r"js\.stripe\.com|api\.stripe", "Stripe", "Payment Processors"),
+    (r"paypal\.com|paypalobjects", "PayPal", "Payment Processors"),
+    (r"\bbraintree\b", "Braintree", "Payment Processors"),
+    (r"squareup|sqpayment", "Square", "Payment Processors"),
+    (r"\badyen\b", "Adyen", "Payment Processors"),
+    (r"checkout\.com", "Checkout.com", "Payment Processors"),
+    (r"\brecurly\b", "Recurly", "Payment Processors"),
+    (r"\bpaddle\.(com|net)", "Paddle", "Payment Processors"),
+    (r"\brazorpay\b", "Razorpay", "Payment Processors"),
+    (r"\bmollie\b", "Mollie", "Payment Processors"),
+    (r"\bchargebee\b", "Chargebee", "Payment Processors"),
+    # Font scripts
+    (r"fonts\.googleapis|fonts\.gstatic|google font", "Google Fonts", "Font Scripts"),
+    (r"typekit|fonts\.adobe", "Adobe Typekit", "Font Scripts"),
+    (r"fonts\.com", "Fonts.com", "Font Scripts"),
+    (r"\bfontdeck\b", "Fontdeck", "Font Scripts"),
+    (r"typotheque", "Typotheque", "Font Scripts"),
+    (r"webfontloader", "Web Font Loader", "Font Scripts"),
+    # UI / web frameworks
+    (r"_next/static|__next_data__|\bnextjs\b|next\.js", "Next.js", "UI/Web Frameworks"),
+    (r"__nuxt__|\bnuxt\b", "Nuxt", "UI/Web Frameworks"),
+    (r"data-reactroot|react[-.]?dom|\breact\b", "React", "UI/Web Frameworks"),
+    (r"data-v-|vue\.js|vuejs|\bvue\b", "Vue.js", "UI/Web Frameworks"),
+    (r"ng-version|\bangular\.?js\b|\bangular\b", "Angular", "UI/Web Frameworks"),
+    (r"\bbackbone\b", "Backbone.js", "UI/Web Frameworks"),
+    (r"\bember\b", "Ember.js", "UI/Web Frameworks"),
+    (r"\bsvelte\b", "Svelte", "UI/Web Frameworks"),
+    (r"\bgatsby\b", "Gatsby", "UI/Web Frameworks"),
+    (r"\bmeteor\b", "Meteor", "UI/Web Frameworks"),
+    (r"\bdjango\b", "Django", "UI/Web Frameworks"),
+    (r"ruby on rails", "Ruby on Rails", "UI/Web Frameworks"),
+    (r"\blaravel\b", "Laravel", "UI/Web Frameworks"),
+    (r"\bexpress\b", "Express", "UI/Web Frameworks"),
+    (r"asp\.net|x-powered-by:.*\.net", "ASP.NET", "UI/Web Frameworks"),
+    (r"\bsymfony\b", "Symfony", "UI/Web Frameworks"),
+    (r"\bflask\b", "Flask", "UI/Web Frameworks"),
+    (r"fastapi", "FastAPI", "UI/Web Frameworks"),
+    # Web servers (before programming languages: server headers carry both)
+    (r"\bnginx\b", "nginx", "Web Servers"),
+    (r"\bapache\b|\bhttpd\b", "Apache HTTP Server", "Web Servers"),
+    (r"microsoft-iis|microsoft iis|\biis\b", "Microsoft IIS", "Web Servers"),
+    (r"\blitespeed\b", "LiteSpeed", "Web Servers"),
+    (r"\bgunicorn\b", "Gunicorn", "Web Servers"),
+    (r"\buwsgi\b", "uWSGI", "Web Servers"),
+    (r"\bcaddy\b", "Caddy", "Web Servers"),
+    (r"\bopenresty\b", "OpenResty", "Web Servers"),
+    (r"\btomcat\b", "Apache Tomcat", "Web Servers"),
+    (r"\bjetty\b", "Jetty", "Web Servers"),
+    (r"wildfly|\bjboss\b", "WildFly/JBoss", "Web Servers"),
+    (r"weblogic", "Oracle WebLogic", "Web Servers"),
+    (r"websphere", "IBM WebSphere", "Web Servers"),
+    (r"\blighttpd\b", "lighttpd", "Web Servers"),
+    (r"simplehttp", "SimpleHTTP", "Web Servers"),
+    (r"\bwerkzeug\b", "Werkzeug", "Web Servers"),
+    (r"\bvarnish\b", "Varnish", "Web Servers"),
+    # Programming languages
+    (r"\bphp\b", "PHP", "Programming Languages"),
+    (r"\bpython\b", "Python", "Programming Languages"),
+    (r"\bruby\b", "Ruby", "Programming Languages"),
+    (r"\bperl\b", "Perl", "Programming Languages"),
+    (r"\bnode(\.js)?\b", "Node.js", "Programming Languages"),
+    (r"\bjava\b", "Java", "Programming Languages"),
+    (r"\bgolang\b|go1\.", "Go", "Programming Languages"),
+    # Libraries
+    (r"jquery-ui|jquery\.ui", "jQuery UI", "Libraries"),
+    (r"\bjquery\b", "jQuery", "Libraries"),
+    (r"\blodash\b", "lodash", "Libraries"),
+    (r"\bunderscore\b", "Underscore.js", "Libraries"),
+    (r"\bmoment\b", "Moment.js", "Libraries"),
+    (r"\baxios\b", "Axios", "Libraries"),
+    (r"d3\.js|d3\.min|d3\.v\d", "D3.js", "Libraries"),
+    (r"\bbootstrap\b", "Bootstrap", "Libraries"),
+    (r"font-?awesome", "Font Awesome", "Libraries"),
+    (r"hammer\.js", "Hammer.js", "Libraries"),
+    (r"\bmodernizr\b", "Modernizr", "Libraries"),
+    (r"requirejs|require\.js", "RequireJS", "Libraries"),
+    (r"\bhandlebars\b", "Handlebars", "Libraries"),
+    (r"\bmustache\b", "Mustache", "Libraries"),
+    (r"chart\.js", "Chart.js", "Libraries"),
+    (r"\bhighcharts\b", "Highcharts", "Libraries"),
+    (r"slick-carousel|slick\.min", "Slick", "Libraries"),
+    (r"\bswiper\b", "Swiper", "Libraries"),
+    (r"\bpopper\b", "Popper.js", "Libraries"),
+    (r"prototype\.js", "Prototype.js", "Libraries"),
+    (r"\bmootools\b", "MooTools", "Libraries"),
+    (r"\bdojo\b", "Dojo", "Libraries"),
+    (r"\byui\b", "YUI", "Libraries"),
+    (r"\bpolyfill", "Polyfill", "Libraries"),
+    (r"\bmathjax\b", "MathJax", "Libraries"),
+    (r"highlight\.js", "highlight.js", "Libraries"),
+    (r"three\.js", "three.js", "Libraries"),
+    (r"anime\.js", "anime.js", "Libraries"),
+    (r"fullcalendar", "FullCalendar", "Libraries"),
+    (r"\bselect2\b", "Select2", "Libraries"),
+    (r"\bdatatables\b", "DataTables", "Libraries"),
+    # Known platforms that fall outside the categories above
+    (r"wordpress|wp-content|wp-includes", "WordPress", "Miscellaneous"),
+    (r"\bdrupal\b", "Drupal", "Miscellaneous"),
+    (r"\bjoomla\b", "Joomla", "Miscellaneous"),
+    (r"\bshopify\b", "Shopify", "Miscellaneous"),
+    (r"wix\.com|wixsite", "Wix", "Miscellaneous"),
+    (r"squarespace", "Squarespace", "Miscellaneous"),
+    (r"\bmagento\b", "Magento", "Miscellaneous"),
+    (r"\btypo3\b", "TYPO3", "Miscellaneous"),
+    (r"prestashop", "PrestaShop", "Miscellaneous"),
+    (r"opencart", "OpenCart", "Miscellaneous"),
+    (r"\bhubspot\b", "HubSpot", "Miscellaneous"),
+    (r"\bintercom\b", "Intercom", "Miscellaneous"),
+    (r"zendesk", "Zendesk", "Miscellaneous"),
+    (r"tawk\.to", "Tawk.to", "Miscellaneous"),
+    (r"\boptimizely\b", "Optimizely", "Miscellaneous"),
+    (r"\bvwo\b", "VWO", "Miscellaneous"),
+]
+
+# response headers that name a product directly (header prefix -> tech, category)
+_HDR_PRODUCT = [
+    ("cf-ray", "Cloudflare", "CDN"),
+    ("cf-cache-status", "Cloudflare", "CDN"),
+    ("cf-mitigated", "Cloudflare", "Security"),
+    ("x-sucuri-", "Sucuri", "Security"),
+    ("x-iinfo", "Imperva/Incapsula", "Security"),
+    ("x-amzn-waf", "AWS WAF", "Security"),
+    ("x-amz-cf-", "Amazon CloudFront", "CDN"),
+    ("x-fastly", "Fastly", "CDN"),
+    ("fastly-", "Fastly", "CDN"),
+    ("x-akamai", "Akamai", "CDN"),
+    ("x-bunnycdn", "BunnyCDN", "CDN"),
+    ("x-stackpath", "StackPath", "CDN"),
+    ("x-newrelic", "New Relic", "RUM"),
+    ("newrelic", "New Relic", "RUM"),
+    ("x-datadog", "Datadog", "RUM"),
+    ("x-sentry", "Sentry", "RUM"),
+]
+
+
+def _tech_classify(text):
+    """Map literal evidence text to (technology, category); None if no rule matches."""
+    low = str(text).lower()
+    for pat, name, cat in _TECH_RULES:
+        if re.search(pat, low):
+            return name, cat
+    return None
+
+
 def parse_tech(output, sess):
-    """whatweb plugin enumerations and nuclei [tech] hits are informational —
-    a technology fingerprint is not, by itself, a vulnerability."""
-    findings = []
-    seen = set()
-    for line in output.splitlines():
-        s = line.strip()
-        m = re.match(r'^(https?://\S+)\s+\[.*?\](.*)', s)
-        if m and 'whatweb' not in s.lower():
-            url = m.group(1)
-            for tok in re.findall(r'([A-Za-z0-9][A-Za-z0-9+_.-]*)\[([^\]\[]{0,30})\]', m.group(2)):
-                name, ver = tok
-                key = (name, ver)
-                if key in seen: continue
-                seen.add(key)
-                path = re.sub(r'https?://[^/]+', '', url) or '/'
-                detail = f"{name}" + (f" version {ver}" if ver and ver != '0' else "")
-                findings.append({"type": "tech_fingerprint", "severity": "info",
-                    "detail": f"{detail} at {url}", "path": path,
-                    "command": f"whatweb -a 3 {url}"})
+    """Classify *observed* web-stack evidence into technology categories.
+
+    Sources (section markers from the recon_tech template): whatweb plugins,
+    response headers, HTML asset/meta tags, nuclei technology hits. A finding
+    is emitted only when the evidence literally contains the signature — an
+    unknown whatweb/nuclei technology is reported verbatim under Miscellaneous,
+    unknown headers/assets are skipped entirely (never guessed)."""
+    findings, seen = [], set()
+    base = _base_url(sess) if isinstance(sess, dict) else ''
+    cmd = f"curl -skIL {base}" if base else ''
+
+    def add(tech, cat, evidence, path='/'):
+        key = (str(tech).lower(), cat)
+        if key in seen or len(findings) >= 40:
+            return
+        seen.add(key)
+        findings.append({"type": "tech_fingerprint", "severity": "info",
+                         "tech": str(tech), "category": cat,
+                         "detail": f"{tech} — {cat} (evidence: {evidence})",
+                         "path": path or '/', "command": cmd})
+
+    ansi = re.compile(r'\x1b\[[0-9;]*[mGKHF]')
+    section = None
+    for raw in output.splitlines():
+        line = ansi.sub('', raw).strip()
+        if not line:
             continue
-        m = re.match(r'^\[([^\]]+)\]\s+(https?://\S+)', s)
-        if m and m.group(1).lower() not in ('info',):
-            tech, url = m.group(1), m.group(2)
-            if tech in seen: continue
-            seen.add(tech)
+        if len(line) > 2 and line.startswith('=') and line.endswith('=') and line.strip('='):
+            section = line.strip('=').strip()
+            continue
+        # whatweb: '<url> [status] Plugin[Value], Plugin, ...'
+        m = re.match(r'^(https?://\S+)\s+\[.*?\](.*)$', line)
+        if m:
+            url, rest = m.group(1), m.group(2)
             path = re.sub(r'https?://[^/]+', '', url) or '/'
-            findings.append({"type": "tech_fingerprint", "severity": "info",
-                "detail": f"{tech} detected at {url}", "path": path,
-                "command": f"nuclei -u {url} -t http/technologies"})
-        if len(findings) >= 15:
-            break
+            for name, ver in re.findall(
+                    r'([A-Za-z0-9][A-Za-z0-9+_.-]*)\[([^\]\[]{0,30})\]', rest):
+                if name.lower() in TECH_NON_TECH:
+                    continue
+                evidence = f"{name}[{ver}]" if ver else name
+                cls = _tech_classify(f"{name} {ver}") or (name, "Miscellaneous")
+                add(cls[0], cls[1], f"whatweb: {evidence}", path)
+            # bare plugins carry no value: 'JQuery', 'HTML5', 'Script'
+            for seg in (s.strip() for s in rest.split(',')):
+                if '[' in seg or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9+_.-]*', seg):
+                    continue
+                if seg.lower() in TECH_NON_TECH:
+                    continue
+                cls = _tech_classify(seg) or (seg, "Miscellaneous")
+                add(cls[0], cls[1], f"whatweb: {seg}", path)
+            continue
+        # nuclei: '[tech-id] [http] [info] url' (silent mode; older builds omit [type] [severity])
+        n = re.match(r'^\[([A-Za-z0-9._:/ -]+)\]', line)
+        if n and re.search(r'https?://', line):
+            tech_id = n.group(1).strip()
+            if tech_id.lower() in ('info', 'http'):
+                continue
+            cls = _tech_classify(tech_id)
+            if not cls:
+                # template id we cannot map to a named technology — never
+                # report a raw template id as if it were a product
+                continue
+            url_m = re.search(r'https?://\S+', line)
+            path = re.sub(r'https?://[^/]+', '', url_m.group(0)) or '/'
+            add(cls[0], cls[1], f"nuclei: [{tech_id}]", path)
+            continue
+        if section == 'HEADERS':
+            h = re.match(r'^([A-Za-z0-9-]+)\s*:\s*(.+)$', line)
+            if not h:
+                continue
+            hname, hval = h.group(1).lower(), h.group(2).strip()
+            if hname == 'server':
+                cls = _tech_classify(hval) or (hval.split()[0], "Web Servers")
+                add(cls[0], cls[1], f"header: {line}")
+            elif hname in ('x-powered-by', 'x-generator', 'x-aspnet-version',
+                           'x-aspnetmvc-version'):
+                cls = _tech_classify(hval) or (hval, "Miscellaneous")
+                add(cls[0], cls[1], f"header: {line}")
+            elif hname == 'via':
+                cls = _tech_classify(hval)      # 'via: 1.1 cloudflare' etc.
+                if cls:
+                    add(cls[0], cls[1], f"header: {line}")
+            else:
+                for prefix, tech, cat in _HDR_PRODUCT:
+                    if hname.startswith(prefix):
+                        add(tech, cat, f"header: {line}")
+                        break
+            continue
+        if section == 'BODY':
+            gen = re.search(r'content=["\']([^"\']+)["\'][^>]*name=["\']?generator', line, re.I)
+            if not gen:
+                gen = re.search(r'name=["\']?generator["\']?[^>]*content=["\']([^"\']+)["\']', line, re.I)
+            if gen:
+                val = gen.group(1).strip()
+                cls = _tech_classify(val) or (val, "Miscellaneous")
+                add(cls[0], cls[1], f"meta generator: {val}")
+                continue
+            if re.search(r'<(script|link|meta|img)\b', line, re.I):
+                cls = _tech_classify(line)       # asset tag: only report a known signature
+                if cls:
+                    add(cls[0], cls[1], f"html: {line[:120]}")
+            else:
+                cls = _tech_classify(line)       # inline marker (__NEXT_DATA__, wp-content, ...)
+                if cls:
+                    add(cls[0], cls[1], f"html: {line[:120]}")
     return findings
 
 PROVIDER_PATTERNS = [
@@ -3174,9 +3627,9 @@ LONG_SUBSTAGE_TIMEOUT = {
     "recon_breach_osint": 900,
     "recon_js_leak": 480,
     "recon_version_cve": 900,
-    "recon_tech": 900,
+    "recon_tech": 400,
     "recon_nuclei": 1800,
-    "recon_content": 1200,
+    "recon_content": 420,
     "recon_ad_enum": 300,
     "recon_cloud": 300,
     "vuln_evidence": 900,
@@ -3193,11 +3646,7 @@ def execute_substage(sid, sub_id):
         if not sess:
             return
         push(sid, "output", {"substage": sub_id, "line": f"[ERROR: substage crashed: {e}]", "type": "error"})
-        with sess['lock']:
-            if sub_id not in sess['completed']:
-                sess['completed'].append(sub_id)
-        push(sid, "completed", {"substage": sub_id, "findings": [], "finding_count": 0, "rc": -1})
-        _advance_chain(sid, sub_id)
+        _complete_substage(sid, sub_id, [], rc=-1)
 
 
 def _run_assessment(sid, sub_id, sub):
@@ -3251,9 +3700,7 @@ def _run_assessment(sid, sub_id, sub):
     sess['assessment'] = recap
     for ln in recap.splitlines():
         push(sid, "output", {"substage": sub_id, "line": ln, "type": "info"})
-    sess['completed'].append(sub_id)
-    push(sid, "completed", {"substage": sub_id, "findings": [], "finding_count": 0, "rc": 0})
-    _advance_chain(sid, sub_id)
+    _complete_substage(sid, sub_id, [], rc=0)
 
 
 def _run_evidence_capture(sid, sub_id, sub):
@@ -3306,10 +3753,7 @@ def _run_evidence_capture(sid, sub_id, sub):
                          "path": "-", "command": "-"})
         _normalize_findings(captured, sess, sub_id)
     sess['findings'][sub_id] = captured
-    sess['completed'].append(sub_id)
-    push(sid, "completed", {"substage": sub_id, "findings": captured,
-         "finding_count": len(captured), "rc": 0})
-    _advance_chain(sid, sub_id)
+    _complete_substage(sid, sub_id, captured, rc=0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3446,11 +3890,7 @@ def _finish_inproc(sid, sub_id, findings, lines):
         push(sid, "output", {"substage": sub_id, "line": ln, "type": typ})
     _normalize_findings(findings, sess, sub_id)
     sess.setdefault('findings', {})[sub_id] = findings
-    if sub_id not in sess['completed']:
-        sess['completed'].append(sub_id)
-    push(sid, "completed", {"substage": sub_id, "findings": findings,
-                            "finding_count": len(findings), "rc": 0})
-    _advance_chain(sid, sub_id)
+    _complete_substage(sid, sub_id, findings, rc=0)
 
 
 def _context(sess):
@@ -3650,9 +4090,11 @@ def _reg_rate_limit(sid, sub_id, sub):
     throttled = 0; had_response = False; attempts = 6
     for _ in range(attempts):
         r = _http('POST', sup['url'], data=body, timeout=5)
-        if r['ok']:
+        # Only a real HTTP response counts as evidence. A connection error is
+        # not throttling and must not be reported as "no rate limit" either.
+        if r['status'] is not None:
             had_response = True
-        if r['status'] == 429 or (not r['ok'] and r['status'] is None):
+        if r['status'] == 429 or (r['status'] is not None and r['status'] == 503):
             throttled += 1
     lines.append((f"[signup] {attempts} rapid attempts, throttled={throttled}", "info"))
     if had_response and throttled == 0:
@@ -3661,8 +4103,13 @@ def _reg_rate_limit(sid, sub_id, sub):
                                    f"attempts (no 429/block) — mass account-creation abuse is unrestricted "
                                    f"(CWE-770).",
                          "command": _req_line('POST', sup['url'], body)})
+    elif not had_response:
+        findings.append({"type": "not_tested", "severity": "info", "path": sup['path'],
+                         "detail": "Registration endpoint never returned an HTTP response — "
+                                   "rate-limit check could not be performed.",
+                         "command": ""})
     else:
-        lines.append(("[signup] throttling/blocking observed or endpoint unreachable", "meta"))
+        lines.append(("[signup] throttling/blocking observed", "meta"))
     _finish_inproc(sid, sub_id, findings, lines)
 
 
@@ -3938,9 +4385,11 @@ def _auth_lockout(sid, sub_id, sub):
     attempts = 6; throttled = 0; responded = False
     for i in range(attempts):
         r = _http('POST', lg['url'], data=_build_login(lg, ident, f'PwmWrong!{i}x9'), timeout=5)
-        if r['ok']:
+        # Only a real HTTP answer proves the endpoint was exercised; a
+        # connection error is neither throttling nor a usable negative.
+        if r['status'] is not None:
             responded = True
-        if r['status'] == 429 or _LOCKOUT_RE.search(r['body'] or ''):
+        if r['status'] in (429, 503) or _LOCKOUT_RE.search(r['body'] or ''):
             throttled += 1
     lines.append((f"[login] {attempts} wrong-password attempts, throttled={throttled}", "info"))
     if responded and throttled == 0:
@@ -3949,8 +4398,12 @@ def _auth_lockout(sid, sub_id, sub):
                                    f"wrong-password attempts for an existing account — online password "
                                    f"guessing is unrestricted (CWE-307).",
                          "command": _req_line('POST', lg['url'], _build_login(lg, ident, 'PwmWrong!0x9'))})
+    elif not responded:
+        findings.append({"type": "not_tested", "severity": "info", "path": lg['path'],
+                         "detail": "Login endpoint never returned an HTTP response — lockout check "
+                                   "could not be performed.", "command": ""})
     else:
-        lines.append(("[login] lockout/throttling observed or endpoint unreachable", "meta"))
+        lines.append(("[login] lockout/throttling observed", "meta"))
     _finish_inproc(sid, sub_id, findings, lines)
 
 
@@ -4110,16 +4563,36 @@ def _session_entropy(sid, sub_id, sub):
                          "detail": "No session cookie value observed — entropy check not applicable.",
                          "command": ""})
         _finish_inproc(sid, sub_id, findings, lines); return
-    v = max(vals, key=len); charset = len(set(v))
-    lines.append((f"[session] {len(vals)} cookie(s); sample len={len(v)} charset={charset}", "info"))
-    if len(v) < 12 or charset < 8:
+    v = max(vals, key=len)
+    uniq = set(vals)
+    # Charset is estimated over every observed value, not one sample; estimated
+    # bits = length x log2(charset). The old length/charset-only test passed a
+    # 12-character token with 8 distinct characters (~36 bits) as "random".
+    charset = len(set(''.join(vals)))
+    est_bits = len(v) * _math.log2(max(charset, 2))
+    lines.append((f"[session] {len(vals)} cookie(s); sample len={len(v)} charset={charset} "
+                  f"est_bits={est_bits:.0f}", "info"))
+    if len(vals) > 1 and len(uniq) == 1:
+        findings.append({"type": "session_entropy", "severity": "critical", "path": lg['path'],
+                         "detail": f"Session identifier is identical across {len(vals)} separate "
+                                   f"logins — the value is static/predictable and can be replayed "
+                                   f"or guessed (CWE-330).",
+                         "command": _req_line('POST', lg['url'], _build_login(lg, ac['username'], '***'))})
+    elif len(v) < 16 or est_bits < 64:
         findings.append({"type": "session_entropy", "severity": "medium", "path": lg['path'],
                          "detail": f"Session identifier appears low-entropy (length {len(v)}, "
-                                   f"{charset} distinct characters in sample) — predictable session ids "
-                                   f"enable hijacking (CWE-330).",
+                                   f"{charset} distinct characters, ~{est_bits:.0f} bits estimated) — "
+                                   f"predictable session ids enable hijacking (CWE-330).",
+                         "command": _req_line('POST', lg['url'], _build_login(lg, ac['username'], '***'))})
+    elif len(vals) > 1 and len(uniq) < len(vals):
+        findings.append({"type": "session_entropy", "severity": "medium", "path": lg['path'],
+                         "detail": f"Session identifier repeated across separate logins "
+                                   f"({len(uniq)} unique values from {len(vals)} logins) — session IDs "
+                                   f"may not be generated randomly (CWE-330).",
                          "command": _req_line('POST', lg['url'], _build_login(lg, ac['username'], '***'))})
     else:
-        lines.append(("[session] session id length/charset consistent with a random token", "info"))
+        lines.append(("[session] session id length/charset/estimated entropy consistent "
+                      "with a random token", "info"))
     _finish_inproc(sid, sub_id, findings, lines)
 
 
@@ -4264,6 +4737,48 @@ INPROC_SUBSTAGES = {
 }
 
 
+_TOOL_ALIASES = {'python': ('python3', 'python'),
+                 'testssl': ('testssl.sh', 'testssl'),
+                 'theHarvester': ('theHarvester', 'theharvester')}
+
+
+def _declared_tools(sub):
+    """Extract the binary names from a substage's human-readable 'tool' field
+    (e.g. 'nmap / masscan' -> ['nmap', 'masscan'])."""
+    raw = (sub.get('tool') or '').strip()
+    if not raw or raw.lower().startswith(('in-process', 'inprocess')):
+        return []
+    names = []
+    for tok in re.split(r'[/,|]', raw):
+        m = re.match(r'([A-Za-z0-9][A-Za-z0-9._+-]*)', tok.strip())
+        if m:
+            names.append(m.group(1))
+    return names
+
+
+def _tool_present(name):
+    return any(shutil.which(c) for c in _TOOL_ALIASES.get(name, (name,)))
+
+
+def _missing_declared_tool(sub, cmd=''):
+    """Return the primary declared binary if none of the tools the command
+    actually invokes are installed, otherwise None.
+
+    The old implementation took the first whitespace token of the shell
+    command. For compound templates (ep_hydra starts with 'WU=...;') that
+    token was a variable assignment, shutil.which() always failed, and the
+    code always ran the fallback path."""
+    names = _declared_tools(sub)
+    if not names:
+        return None
+    referenced = [n for n in names
+                  if re.search(rf'(?<![\w.-]){re.escape(n)}(?![\w.-])', cmd or '', re.I)]
+    candidates = referenced or names
+    if any(_tool_present(n) for n in candidates):
+        return None
+    return candidates[0]
+
+
 def _execute_substage(sid, sub_id):
     sess = sessions.get(sid)
     sub = find_sub(sub_id)
@@ -4293,46 +4808,34 @@ def _execute_substage(sid, sub_id):
                 "command": ""}]
         _normalize_findings(fnd, sess, sub_id)
         sess.setdefault('findings', {})[sub_id] = fnd
-        sess['completed'].append(sub_id)
-        push(sid, "completed", {"substage": sub_id, "findings": fnd,
-             "finding_count": len(fnd), "rc": 0})
-        _advance_chain(sid, sub_id)
+        _complete_substage(sid, sub_id, fnd, rc=0)
         return
 
     if sub_id in INPROC_SUBSTAGES:
         INPROC_SUBSTAGES[sub_id](sid, sub_id, sub)
         return
 
-    if PWM_CMD_TIMEOUT > 0:
-        sub_timeout = sub.get('timeout') or LONG_SUBSTAGE_TIMEOUT.get(sub_id)
-        try:
-            timeout = float(sub_timeout) if sub_timeout else PWM_CMD_TIMEOUT
-        except (TypeError, ValueError):
+    # Per-substage wall-clock cap. Previously every LONG_SUBSTAGE_TIMEOUT was
+    # ignored unless PWM_CMD_TIMEOUT>0 (default 0), leaving sqlmap/nuclei/hydra
+    # unbounded. The per-substage value now always applies; the global value is
+    # used as a fallback and as an upper bound when set.
+    timeout = None
+    sub_timeout = sub.get('timeout') or LONG_SUBSTAGE_TIMEOUT.get(sub_id)
+    try:
+        if sub_timeout:
+            timeout = float(sub_timeout)
+        elif PWM_CMD_TIMEOUT > 0:
             timeout = PWM_CMD_TIMEOUT
-        if timeout <= 0:
-            timeout = None
-    else:
+    except (TypeError, ValueError):
+        timeout = None
+    if PWM_CMD_TIMEOUT > 0 and (timeout is None or timeout > PWM_CMD_TIMEOUT):
+        timeout = PWM_CMD_TIMEOUT
+    if timeout is not None and timeout <= 0:
         timeout = None
 
     cmd_template = sub.get('cmd_template', 'echo "no command"')
     cmd = make_cmd(cmd_template, sess)
-    _parts = cmd.strip().split()
-    _raw_bin = _parts[0] if _parts else ''
-    if _raw_bin == 'sudo' and len(_parts) > 1:
-        _raw_bin = _parts[1]
-    if _raw_bin == 'timeout':
-        # resolve the real tool behind 'timeout -k 5 N <tool> ...' so
-        # missing-tool fallback still keys off the actual binary
-        for _tok in _parts[1:]:
-            if _tok.startswith('-') or re.fullmatch(r'[\d.]+', _tok):
-                continue
-            _raw_bin = _tok
-            break
-    skip_check = _raw_bin in ('echo','for','bash','sh','curl','nc','python3','dig',
-                               'host','whois','redis-cli','mysql','psql','mysqladmin','mongo',
-                               'if','case','while','until','mkdir','cd','export','set','[')
-    tool_bin = None if skip_check else _raw_bin
-    if 'nmap' in cmd[:30]: tool_bin = 'nmap'
+    tool_bin = _missing_declared_tool(sub)
 
     if tool_bin and not shutil.which(tool_bin):
         fallback = sub.get('fallback_cmd')
@@ -4341,9 +4844,7 @@ def _execute_substage(sid, sub_id):
             push(sid, "output", {"substage": sub_id, "line": f"[{tool_bin} not found → fallback]", "type": "meta"})
         else:
             push(sid, "output", {"substage": sub_id, "line": f"[{tool_bin} not installed — skipped]", "type": "error"})
-            sess['completed'].append(sub_id)
-            push(sid, "completed", {"substage": sub_id, "findings": [], "finding_count": 0, "rc": -1})
-            _advance_chain(sid, sub_id)
+            _complete_substage(sid, sub_id, [], rc=-1)
             return
 
     if sub.get('requires_root') and os.geteuid() != 0:
@@ -4357,9 +4858,7 @@ def _execute_substage(sid, sub_id):
                 push(sid, "output", {"substage": sub_id, "line": "[requires root → fallback]", "type": "meta"})
             else:
                 push(sid, "output", {"substage": sub_id, "line": "[requires root — skipped]", "type": "error"})
-                sess['completed'].append(sub_id)
-                push(sid, "completed", {"substage": sub_id, "findings": [], "finding_count": 0, "rc": -1})
-                _advance_chain(sid, sub_id)
+                _complete_substage(sid, sub_id, [], rc=-1)
                 return
 
     sess['commands'][sub_id] = cmd
@@ -4391,26 +4890,58 @@ def _execute_substage(sid, sub_id):
                         sess['banner_search'] = ' '.join(parts[3:5])
                     break
 
-    sess['completed'].append(sub_id)
-    push(sid, "completed", {
-        "substage": sub_id,
-        "findings": findings,
-        "finding_count": len(findings),
-        "rc": rc,
-    })
+    _complete_substage(sid, sub_id, findings, rc=rc)
+
+
+def _complete_substage(sid, sub_id, findings=None, rc=0):
+    """Single completion path for every substage.
+
+    Guarantees the substage is recorded exactly once, never resurrects a
+    substage the operator skipped while it was running, and mutates the
+    session's completed list under its lock. Returns True when this call
+    performed the transition."""
+    sess = sessions.get(sid)
+    if sess is None:
+        return False
+    findings = findings or []
+    with sess['lock']:
+        if sub_id in sess['skipped'] or sub_id in sess['completed']:
+            return False
+        sess['completed'].append(sub_id)
+    push(sid, "completed", {"substage": sub_id, "findings": findings,
+                            "finding_count": len(findings), "rc": rc})
     _advance_chain(sid, sub_id)
+    return True
 
 
 def _advance_chain(sid, completed_sub_id):
+    """Notify stage completion and sequence the next substage.
+
+    Parallel stages complete once every substage is done. Serial stages only
+    auto-advance when the whole stage was approved via /approve_stage — a
+    single /approve must never start the rest of the stage."""
     sess = sessions.get(sid)
-    if not sess: return
+    if not sess:
+        return
     stage = find_stage_for_sub(completed_sub_id)
-    if not stage: return
+    if not stage:
+        return
+    stage_sub_ids = [s['id'] for s in stage['substages']]
+    approved_stages = sess.get('stage_approved') or set()
+    with sess['lock']:
+        done = set(sess['completed']) | set(sess['skipped'])
     if stage.get('parallel'):
-        stage_sub_ids = [s['id'] for s in stage['substages']]
-        done = [i for i in sess['completed'] + sess['skipped'] if i in stage_sub_ids]
-        if set(stage_sub_ids).issubset(set(done)):
+        if set(stage_sub_ids).issubset(done):
             push(sid, "stage_complete", {"stage": stage['id']})
+        return
+    if stage['id'] in approved_stages:
+        for s_id in stage_sub_ids:
+            if s_id in done:
+                continue
+            _launch_substage(sid, s_id)
+            break
+    if set(stage_sub_ids).issubset(done):
+        push(sid, "stage_complete", {"stage": stage['id']})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4435,7 +4966,27 @@ PWM_LOGO = os.path.join(_ASSETS_DIR, 'pwm.png')
 
 @app.route('/')
 def index():
+    if PWM_API_TOKEN and not _token_ok():
+        return Response(_login_page(), status=401, mimetype='text/html')
     return send_file(os.path.join(BASE_DIR, 'frontend.html'))
+
+
+@app.route('/auth', methods=['GET', 'POST'])
+def auth_page():
+    """Exchange the operator token for a HttpOnly cookie so the bundled UI
+    (including EventSource, which cannot send custom headers) can authenticate."""
+    if not PWM_API_TOKEN:
+        return redirect('/')
+    token = request.values.get('token', '')
+    if token and hmac.compare_digest(token, PWM_API_TOKEN):
+        resp = redirect('/')
+        resp.set_cookie('pwm_api_token', PWM_API_TOKEN, httponly=True,
+                        samesite='Strict', secure=request.is_secure,
+                        max_age=8 * 3600, path='/')
+        return resp
+    if request.method == 'POST':
+        return Response(_login_page('Invalid token.'), status=401, mimetype='text/html')
+    return Response(_login_page(), status=401, mimetype='text/html')
 
 
 @app.route('/assets/<path:fname>')
@@ -4468,9 +5019,14 @@ def new_session():
     if not is_valid_target(target):
         return jsonify({"error": "Invalid target. Use a hostname, IPv4 (with optional /CIDR), IPv6 or http(s) URL."}), 400
     sid = str(uuid.uuid4())
-    outdir = f"/tmp/pwm_{sid[:8]}"
-    os.makedirs(outdir, exist_ok=True, mode=0o700)
-    os.chmod(outdir, 0o700)
+    # mkdtemp creates a unique 0700 directory atomically — a predictable
+    # /tmp/pwm_<sid-prefix> path with exist_ok could be pre-created/symlinked
+    # by another local user and redirect evidence writes.
+    outdir = tempfile.mkdtemp(prefix='pwm_')
+    try:
+        os.chmod(outdir, 0o700)
+    except OSError:
+        pass
     sessions[sid] = {
         "sid": sid, "raw_target": raw, "target": target,
         "target_type": detect_target_type(raw),
@@ -4478,6 +5034,7 @@ def new_session():
         "outdir": outdir,
         "findings": {}, "outputs": {}, "commands": {},
         "completed": [], "approved": [], "skipped": [], "launched": set(),
+        "stage_approved": set(),
         "lock": threading.Lock(),
         "ports_found": "", "banner_search": target,
         "network": infer_network(target), "notes": {},
@@ -4493,9 +5050,8 @@ def delete_session(sid):
     sess = sessions.get(sid)
     if not sess: return jsonify({"error":"unknown session"}), 404
     with sess['lock']:
-        q = output_queues.get(sid)
-        if q is not None:
-            q.put({"event": "session_gone", "data": "{}"})
+        if output_queues.get(sid) is not None:
+            push(sid, "session_gone", {})
         output_queues.pop(sid, None)
         sessions.pop(sid, None)
     shutil.rmtree(sess['outdir'], ignore_errors=True)
@@ -4521,26 +5077,27 @@ def manual_triage(sid):
         return jsonify({"error":"invalid index"}), 400
     if verdict not in ('confirmed', 'tool-confirmed', 'needs_review', 'info'):
         return jsonify({"error":"invalid verdict"}), 400
-    fs = sess['findings'].get(sub_id, [])
-    if index < 0 or index >= len(fs):
-        return jsonify({"error":"index out of range"}), 400
-    f = fs[index]
-    f['triage'] = {"verdict": verdict, "basis": f.get('triage', {}).get('basis', ''),
-                   "provenance": "analyst", "note": note,
-                   "ts": datetime.now().isoformat()}
-    log = sess.get('triage_log', {})
-    recs = log.get(sub_id, [])
-    if recs and any(r.get('index') == index for r in recs):
-        for r in recs:
-            if r.get('index') == index:
-                r.update({"verdict": verdict, "note": note, "provenance": "analyst",
-                          "ts": f['triage']['ts']})
-    else:
-        recs.append({"index": index, "type": f.get('type'), "severity": f.get('severity'),
-                     "verdict": verdict, "basis": f['triage']['basis'], "provenance": "analyst",
-                     "note": note, "ts": f['triage']['ts']})
-    log[sub_id] = recs
-    sess['triage_log'] = log
+    with sess['lock']:
+        fs = sess['findings'].get(sub_id, [])
+        if index < 0 or index >= len(fs):
+            return jsonify({"error":"index out of range"}), 400
+        f = fs[index]
+        f['triage'] = {"verdict": verdict, "basis": f.get('triage', {}).get('basis', ''),
+                       "provenance": "analyst", "note": note,
+                       "ts": datetime.now().isoformat()}
+        log = sess.get('triage_log', {})
+        recs = log.get(sub_id, [])
+        if recs and any(r.get('index') == index for r in recs):
+            for r in recs:
+                if r.get('index') == index:
+                    r.update({"verdict": verdict, "note": note, "provenance": "analyst",
+                              "ts": f['triage']['ts']})
+        else:
+            recs.append({"index": index, "type": f.get('type'), "severity": f.get('severity'),
+                         "verdict": verdict, "basis": f['triage']['basis'], "provenance": "analyst",
+                         "note": note, "ts": f['triage']['ts']})
+        log[sub_id] = recs
+        sess['triage_log'] = log
     return jsonify({"ok": True, "verdict": verdict})
 
 @app.route('/api/session/<sid>/approve', methods=['POST'])
@@ -4552,18 +5109,15 @@ def approve(sid):
     note = data.get('note','')
     if not sub_id or not find_sub(sub_id):
         return jsonify({"error":"unknown substage"}), 400
-    if sub_id not in sess['approved']:
-        sess['approved'].append(sub_id)
-    if note:
-        sess['notes'][sub_id] = note
-    stage = find_stage_for_sub(sub_id)
-    if stage and stage.get('parallel'):
-        for s_id in [s['id'] for s in stage['substages']]:
-            if s_id not in sess['approved']:
-                sess['approved'].append(s_id)
-            _launch_substage(sid, s_id)
-    else:
-        _launch_substage(sid, sub_id)
+    with sess['lock']:
+        if sub_id not in sess['approved']:
+            sess['approved'].append(sub_id)
+        if note:
+            sess['notes'][sub_id] = note
+    # A per-substage approval starts exactly that substage. Expanding to the
+    # whole parallel stage ignored the operator's choice and ran unapproved
+    # probes (including intrusive ones) without consent.
+    _launch_substage(sid, sub_id)
     return jsonify({"ok": True})
 
 @app.route('/api/session/<sid>/approve_stage', methods=['POST'])
@@ -4574,12 +5128,22 @@ def approve_stage(sid):
     stage_id = data.get('stage_id')
     stage = next((s for s in CHAIN if s['id'] == stage_id), None)
     if not stage: return jsonify({"error":"unknown stage"}), 404
+    with sess['lock']:
+        sess.setdefault('stage_approved', set()).add(stage['id'])
+        for sub in stage['substages']:
+            if sub['id'] not in sess['approved']:
+                sess['approved'].append(sub['id'])
     launched = []
-    for sub in stage['substages']:
-        if sub['id'] not in sess['approved']:
-            sess['approved'].append(sub['id'])
-        if _launch_substage(sid, sub['id']):
-            launched.append(sub['id'])
+    if stage.get('parallel'):
+        targets = [s['id'] for s in stage['substages']]
+    else:
+        # Serial stages run one substage at a time; _advance_chain starts the
+        # next one when the current one completes. Launching them all here ran
+        # a strictly ordered chain concurrently and corrupted its dependencies.
+        targets = [stage['substages'][0]['id']] if stage['substages'] else []
+    for s_id in targets:
+        if _launch_substage(sid, s_id):
+            launched.append(s_id)
     return jsonify({"ok": True, "launched": launched})
 
 @app.route('/api/session/<sid>/skip', methods=['POST'])
@@ -5312,25 +5876,31 @@ if __name__ == '__main__':
 
     def _janitor():
         import time as _t
-        import contextlib
         while True:
-            _t.sleep(300)
-            stale = []
-            for sid, sess in sessions.items():
-                created = datetime.fromisoformat(sess.get('created', '')) if sess.get('created') else None
-                if created and (_t.time() - created.timestamp()) > 6 * 3600:
-                    stale.append(sid)
-            for sid in stale:
-                sess = sessions.get(sid)
-                if sess:
-                    with sess['lock']:
-                        q = output_queues.get(sid)
-                        if q is not None:
-                            q.put({"event": "session_gone", "data": "{}"})
-                        output_queues.pop(sid, None)
-                        sessions.pop(sid, None)
-                    shutil.rmtree(sess['outdir'], ignore_errors=True)
-                    print(f"[janitor] purged stale session {sid}")
+            try:
+                _t.sleep(300)
+                stale = []
+                # Snapshot the dict: iterating sessions.items() directly raced
+                # with request threads and killed this thread permanently.
+                for sid, sess in list(sessions.items()):
+                    created = datetime.fromisoformat(sess.get('created', '')) if sess.get('created') else None
+                    if created and (_t.time() - created.timestamp()) > 6 * 3600:
+                        stale.append(sid)
+                for sid in stale:
+                    sess = sessions.get(sid)
+                    if sess:
+                        with sess['lock']:
+                            if sessions.get(sid) is not sess:
+                                continue
+                            if output_queues.get(sid) is not None:
+                                push(sid, "session_gone", {})
+                            output_queues.pop(sid, None)
+                            sessions.pop(sid, None)
+                        shutil.rmtree(sess['outdir'], ignore_errors=True)
+                        print(f"[janitor] purged stale session {sid}")
+            except Exception as e:
+                # Never let one transient failure stop cleanup forever.
+                print(f"[janitor] error: {e!r}", flush=True)
 
     threading.Thread(target=_janitor, daemon=True).start()
     app.run(debug=False, threaded=True, host=PWM_BIND, port=PWM_PORT)

@@ -4,7 +4,7 @@
 
 ## Features
 
-- 7-stage automated "kill chain" workflow: Reconnaissance, Vulnerability Analysis, Deep & Zero-Day Analysis, API Vulnerability Scan, Database Vulnerability Scan, Exploitation Prep, and Post-Exploitation Review
+- 12-stage automated "kill chain" workflow: Reconnaissance, Vulnerability Analysis, Deep & Zero-Day Analysis, API Vulnerability Scan, Database Vulnerability Scan, Registration & Account Provisioning, Authentication & Login, Session Management, Authorization & Access Control, Business Logic, Exploitation Prep, and Post-Exploitation Review
 - Flask-based web app with live, real-time output streaming (Server-Sent Events) to a browser frontend
 - Port and service scanning via nmap / masscan (full TCP sweep + targeted service/version detection)
 - UDP service probing (SNMP, DNS, TFTP, NTP, LDAP, etc.)
@@ -15,7 +15,7 @@
 - CVE mapping via nmap vulners/vulscan and Nuclei template scanning
 - ExploitDB lookups via searchsploit
 - Web directory/file brute-forcing (gobuster/ffuf) and Nikto web audits
-- Deep TLS/SSL analysis (cipher suites, Heartbleed, POODLE, ROBOT, CRIME, BEAST, SWEET32)
+- Deep TLS/SSL analysis: protocol and cipher-suite audit via sslscan/testssl, certificate checks, and Heartbleed detection
 - SNMP community string probing
 - SMTP/LDAP/FTP security audits
 - Banner anomaly detection and version-gap/EOL analysis against a built-in version database
@@ -35,7 +35,7 @@
 - Structured findings output with severity ratings, affected paths, and remediation commands
 - PDF report generation with proof-of-concept and code-fix remediation examples
 - Command injection safeguards via target input validation and sanitization
-- Optional API token authentication for API routes
+- Optional API token authentication (`PWM_API_TOKEN`): header/query token for scripts, and a `/auth` page that stores the token in an HttpOnly cookie so the bundled UI and its EventSource stream work without custom headers
 
 ## Installation
 
